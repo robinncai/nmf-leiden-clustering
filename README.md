@@ -226,7 +226,75 @@ python nmf_leiden_clustering.py test_data/test_neighborhood_freqs_10000.csv \
 # Run the pipeline with recommended parameters
 python nmf_leiden_clustering.py test_data/test_neighborhood_freqs_10000.csv \
     -n 5 -r 0.5 -o test_results
+
+# Generate visualizations
+python visualize.py test_results/test_neighborhood_freqs_10000_nmf_leiden_clusters.csv \
+    -m metadata.csv -o plots
 ```
+
+## Visualization
+
+After running the clustering pipeline, use `visualize.py` to generate UMAP plots for quality control and batch effect detection.
+
+### Basic usage
+
+```bash
+python visualize.py results/your_file_nmf_leiden_clusters.csv -o plots
+```
+
+### With metadata (batch/subtype coloring)
+
+```bash
+python visualize.py results/your_file_nmf_leiden_clusters.csv \
+    -m /path/to/harmonized_level12.csv \
+    -o plots
+```
+
+The metadata file should have columns: `fov`, `label`, `batch`, `Subtype`
+
+### Visualization options
+
+```bash
+python visualize.py cluster_results.csv \
+    -m metadata.csv \
+    -o plots \
+    --n-neighbors 15 \
+    --min-dist 0.1 \
+    --point-size 1.0 \
+    --subsample 100000
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-m`, `--metadata` | None | Path to metadata CSV with batch/Subtype |
+| `-o`, `--output-dir` | plots | Output directory |
+| `--n-neighbors` | 15 | UMAP n_neighbors parameter |
+| `--min-dist` | 0.1 | UMAP min_dist parameter |
+| `--point-size` | 1.0 | Size of scatter points |
+| `--subsample` | None | Subsample to N cells for faster plotting |
+
+### Output plots
+
+| File | Description |
+|------|-------------|
+| `*_umap_clusters.png` | UMAP colored by Leiden cluster |
+| `*_umap_batch.png` | UMAP colored by batch (detects batch effects) |
+| `*_umap_subtype.png` | UMAP colored by subtype |
+| `*_small_multiples.png` | One panel per cluster (reveals shape, fragmentation) |
+| `*_umap_coords.csv` | UMAP coordinates for custom plotting |
+
+### Interpreting the plots
+
+**UMAP by cluster**: Check for clear separation between clusters. Overlapping clusters may indicate over-clustering (try lower resolution).
+
+**UMAP by batch**: If clusters separate by batch rather than biology, you have batch effects. Consider batch correction or stratified analysis.
+
+**UMAP by subtype**: Verify biological signal. Subtypes should show meaningful structure (e.g., separation or gradients).
+
+**Small multiples**: Each panel highlights one cluster. Look for:
+- Compact, well-defined shapes (good)
+- Fragmented clusters split across UMAP (may need different parameters)
+- Bridges between clusters (may be over-split)
 
 ## Memory Considerations
 
