@@ -130,17 +130,102 @@ NMF basis matrix showing how each cell type contributes to each factor:
 | `NMF_factor_2` | Weight for factor 2 |
 | ... | Additional factors |
 
+## Tuning Mode
+
+Before running on your full dataset, use tuning mode to find optimal hyperparameters:
+
+```bash
+python nmf_leiden_clustering.py input_file.csv --tune -o tuning_results
+```
+
+### What tuning mode does
+
+1. **Subsamples data** - Stratified by FOV to maintain representation (default: 200k cells)
+2. **Evaluates n_components** - Reports reconstruction error for each value
+3. **Grid search** - Tests all combinations of n/k/r parameters
+4. **Stability analysis** - Measures clustering consistency (ARI) across random seeds
+5. **Generates report** - Provides recommendations based on results
+
+### Tuning options
+
+```bash
+python nmf_leiden_clustering.py input_file.csv --tune \
+    --tune-subsample 200000 \
+    --tune-n "5,8,10,12,15" \
+    --tune-k "10,15,20,30" \
+    --tune-r "0.1,0.3,0.5,0.8,1.0" \
+    -o tuning_results
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--tune-subsample` | 200000 | Number of cells to subsample |
+| `--tune-n` | 5,8,10,12,15 | n_components values to try |
+| `--tune-k` | 10,15,20,30 | n_neighbors values to try |
+| `--tune-r` | 0.1,0.3,0.5,0.8,1.0 | resolution values to try |
+
+### Tuning output files
+
+- `*_nmf_reconstruction.csv` - Reconstruction error vs n_components
+- `*_grid_search.csv` - Cluster counts/sizes for all parameter combinations
+- `*_stability.csv` - ARI stability metrics vs resolution
+- `*_tuning_report.txt` - Human-readable summary with recommendations
+
+### Example tuning report
+
+```
+============================================================
+NMF + LEIDEN CLUSTERING TUNING REPORT
+============================================================
+
+Subsample size: 200,000 cells
+
+----------------------------------------
+1. RECONSTRUCTION ERROR vs n_components
+----------------------------------------
+  n= 5  error=1.661571
+  n= 8  error=0.892341
+  n=10  error=0.654123
+
+  Suggested n_components: 8 (elbow method)
+
+----------------------------------------
+2. STABILITY (ARI) vs resolution
+----------------------------------------
+  r=0.1  ARI=0.9234 ± 0.0312
+  r=0.3  ARI=0.8856 ± 0.0445
+  r=0.5  ARI=0.8123 ± 0.0567
+
+  Most stable resolution: 0.1 (ARI=0.9234)
+
+----------------------------------------
+3. CLUSTER COUNTS vs parameters
+----------------------------------------
+  r=0.1  n_clusters=    5-12  min_size=1200-5000
+  r=0.3  n_clusters=   10-25  min_size=400-2000
+  r=0.5  n_clusters=   15-40  min_size=150-800
+
+----------------------------------------
+4. RECOMMENDATIONS
+----------------------------------------
+  Recommended: n=8, k=15, r=0.3
+    -> 18 clusters, min size=850
+============================================================
+```
+
 ## Example: Generate Test Data
 
 ```bash
 # Generate 10,000 synthetic cells for testing
 python create_test_data.py -n 10000 -o test_data
 
-# Run the pipeline on test data
+# Run tuning on test data
 python nmf_leiden_clustering.py test_data/test_neighborhood_freqs_10000.csv \
-    -n 5 \
-    -r 0.5 \
-    -o test_results
+    --tune --tune-subsample 5000 -o tuning_test
+
+# Run the pipeline with recommended parameters
+python nmf_leiden_clustering.py test_data/test_neighborhood_freqs_10000.csv \
+    -n 5 -r 0.5 -o test_results
 ```
 
 ## Memory Considerations
