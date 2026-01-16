@@ -29,6 +29,10 @@ wheels/
 test_data/
 test_results/
 results/
+tuning_test/
+test_plots/
+results_no_norm/
+results_with_norm/
 
 # IDE
 .idea/
