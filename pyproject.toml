@@ -10,8 +10,8 @@ dependencies = [
     "scikit-learn>=1.3.0",
     "scanpy>=1.9.6",
     "anndata>=0.10.0",
-    "leidenalg>=0.10.0",
-    "igraph>=0.11.0",
+    "leidenalg==0.10.2",  # Pinned for HPC compatibility (glibc 2.17+)
+    "igraph>=0.10.0,<0.12.0",  # Compatible with leidenalg 0.10.2
     "pynndescent>=0.5.11",
     "numba>=0.58.0",
     "llvmlite>=0.41.0",
