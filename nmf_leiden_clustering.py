@@ -23,7 +23,7 @@ import json
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import MiniBatchNMF
-from sklearn.metrics import adjusted_rand_score
+from sklearn.metrics import adjusted_rand_score, silhouette_score, davies_bouldin_score
 import scanpy as sc
 import anndata as ad
 
@@ -86,6 +86,45 @@ def load_data_chunked(
 
     logger.info(f"Loaded {data_matrix.shape[0]:,} cells x {data_matrix.shape[1]} features")
     return metadata_df, data_matrix, feature_cols
+
+
+def normalize_by_fov(
+    metadata_df: pd.DataFrame,
+    data_matrix: np.ndarray,
+    fov_col: str = 'fov'
+) -> np.ndarray:
+    """
+    Normalize cell type composition by FOV-level (sample-level) composition.
+
+    This reduces sample-level batch effects by dividing each cell's composition
+    by the mean composition of all cells in the same FOV/tissue section.
+    This facilitates comparisons across samples.
+
+    Args:
+        metadata_df: DataFrame with metadata (must have fov column)
+        data_matrix: Cell type composition matrix (cells x features)
+        fov_col: Name of the FOV/sample column
+
+    Returns:
+        Normalized data matrix (same shape as input)
+    """
+    logger.info("Applying sample-level (FOV) normalization...")
+
+    normalized = data_matrix.copy()
+    fov_values = metadata_df[fov_col].values
+
+    for fov in np.unique(fov_values):
+        mask = fov_values == fov
+        fov_mean = data_matrix[mask].mean(axis=0)
+
+        # Avoid division by zero
+        fov_mean = np.where(fov_mean == 0, 1e-10, fov_mean)
+
+        # Normalize: divide each cell's composition by FOV mean
+        normalized[mask] = data_matrix[mask] / fov_mean
+
+    logger.info(f"Normalized {len(np.unique(fov_values))} FOVs")
+    return normalized.astype(np.float32)
 
 
 def run_minibatch_nmf(
@@ -255,9 +294,14 @@ def run_nmf_with_reconstruction_error(
     batch_size: int = 1024,
     max_iter: int = 200,
     random_state: int = 42
-) -> Tuple[np.ndarray, float]:
+) -> Tuple[np.ndarray, float, float]:
     """
-    Run NMF and return factor loadings with reconstruction error.
+    Run NMF and return factor loadings with reconstruction error and explained variance.
+
+    Returns:
+        W: Factor loadings matrix (cells x components)
+        reconstruction_err: Frobenius norm of reconstruction error
+        explained_variance_ratio: Proportion of variance explained (0-1)
     """
     X_nn = np.clip(X, 0, None)
 
@@ -275,7 +319,16 @@ def run_nmf_with_reconstruction_error(
     )
 
     W = model.fit_transform(X_nn)
-    return W.astype(np.float32), model.reconstruction_err_
+    H = model.components_
+
+    # Calculate explained variance ratio
+    # Reconstruction: W @ H, Total variance: ||X||^2_F
+    reconstruction = W @ H
+    total_variance = np.sum(X_nn ** 2)
+    residual_variance = np.sum((X_nn - reconstruction) ** 2)
+    explained_variance_ratio = 1.0 - (residual_variance / total_variance)
+
+    return W.astype(np.float32), model.reconstruction_err_, explained_variance_ratio
 
 
 def run_leiden_with_labels(
@@ -309,16 +362,41 @@ def run_leiden_with_labels(
     return adata.obs['leiden'].values.astype(int)
 
 
-def compute_cluster_stats(labels: np.ndarray) -> Dict:
-    """Compute cluster statistics."""
+def compute_cluster_stats(labels: np.ndarray, factor_matrix: np.ndarray = None) -> Dict:
+    """
+    Compute cluster statistics and quality metrics.
+
+    Args:
+        labels: Cluster assignments
+        factor_matrix: Optional factor loadings for computing quality metrics
+
+    Returns:
+        Dictionary with cluster statistics and quality metrics
+    """
     unique, counts = np.unique(labels, return_counts=True)
-    return {
+
+    stats = {
         'n_clusters': len(unique),
         'min_cluster_size': int(counts.min()),
         'max_cluster_size': int(counts.max()),
         'median_cluster_size': int(np.median(counts)),
         'cluster_sizes': {int(k): int(v) for k, v in zip(unique, counts)}
     }
+
+    # Add quality metrics if factor matrix is provided and we have > 1 cluster
+    if factor_matrix is not None and len(unique) > 1:
+        try:
+            stats['silhouette_score'] = float(silhouette_score(factor_matrix, labels))
+            stats['davies_bouldin_score'] = float(davies_bouldin_score(factor_matrix, labels))
+        except Exception:
+            # Handle edge cases (e.g., all same cluster)
+            stats['silhouette_score'] = None
+            stats['davies_bouldin_score'] = None
+    else:
+        stats['silhouette_score'] = None
+        stats['davies_bouldin_score'] = None
+
+    return stats
 
 
 def compute_stability_ari(
@@ -407,22 +485,23 @@ def run_tuning(
         metadata_df, data_matrix, n_subsample, random_state
     )
 
-    # Step 2: Evaluate n_components (reconstruction error)
-    logger.info("\n[Step 2] Evaluating n_components (reconstruction error)...")
+    # Step 2: Evaluate n_components (reconstruction error + explained variance)
+    logger.info("\n[Step 2] Evaluating n_components (reconstruction error + explained variance)...")
     nmf_results = []
     W_cache = {}
 
     for n in n_components_list:
         logger.info(f"  n_components={n}...")
-        W, recon_err = run_nmf_with_reconstruction_error(
+        W, recon_err, explained_var = run_nmf_with_reconstruction_error(
             data_matrix, n, batch_size=batch_size, random_state=random_state
         )
         W_cache[n] = W
         nmf_results.append({
             'n_components': n,
-            'reconstruction_error': recon_err
+            'reconstruction_error': recon_err,
+            'explained_variance': explained_var
         })
-        logger.info(f"    reconstruction_error={recon_err:.6f}")
+        logger.info(f"    reconstruction_error={recon_err:.6f}, explained_variance={explained_var:.4f}")
 
     nmf_df = pd.DataFrame(nmf_results)
 
@@ -441,17 +520,26 @@ def run_tuning(
 
                 # Run clustering
                 labels = run_leiden_with_labels(W, r, k, random_state)
-                stats = compute_cluster_stats(labels)
+                stats = compute_cluster_stats(labels, W)
 
-                grid_results.append({
+                result = {
                     'n_components': n,
                     'n_neighbors': k,
                     'resolution': r,
                     'n_clusters': stats['n_clusters'],
                     'min_cluster_size': stats['min_cluster_size'],
                     'max_cluster_size': stats['max_cluster_size'],
-                    'median_cluster_size': stats['median_cluster_size']
-                })
+                    'median_cluster_size': stats['median_cluster_size'],
+                    'silhouette_score': stats['silhouette_score'],
+                    'davies_bouldin_score': stats['davies_bouldin_score']
+                }
+                grid_results.append(result)
+
+                # Log quality metrics
+                sil = stats['silhouette_score']
+                db = stats['davies_bouldin_score']
+                if sil is not None:
+                    logger.info(f"    clusters={stats['n_clusters']}, silhouette={sil:.4f}, DB={db:.4f}")
 
     grid_df = pd.DataFrame(grid_results)
 
@@ -509,21 +597,30 @@ def generate_tuning_report(
     stability_df: pd.DataFrame,
     n_subsample: int
 ) -> str:
-    """Generate a human-readable tuning report."""
+    """Generate a human-readable tuning report with comprehensive metrics."""
     lines = [
-        "=" * 60,
+        "=" * 70,
         "NMF + LEIDEN CLUSTERING TUNING REPORT",
-        "=" * 60,
+        "=" * 70,
         f"\nSubsample size: {n_subsample:,} cells",
-        "\n" + "-" * 40,
-        "1. RECONSTRUCTION ERROR vs n_components",
-        "-" * 40,
+        "\n" + "-" * 50,
+        "1. NMF: RECONSTRUCTION ERROR & EXPLAINED VARIANCE",
+        "-" * 50,
     ]
 
-    for _, row in nmf_df.iterrows():
-        lines.append(f"  n={int(row['n_components']):2d}  error={row['reconstruction_error']:.6f}")
+    # Check if explained_variance column exists
+    has_explained_var = 'explained_variance' in nmf_df.columns
 
-    # Find elbow (largest drop in error)
+    for _, row in nmf_df.iterrows():
+        if has_explained_var:
+            lines.append(
+                f"  n={int(row['n_components']):2d}  error={row['reconstruction_error']:.6f}  "
+                f"explained_var={row['explained_variance']:.4f}"
+            )
+        else:
+            lines.append(f"  n={int(row['n_components']):2d}  error={row['reconstruction_error']:.6f}")
+
+    # Find elbow and suggest n_components
     if len(nmf_df) > 1:
         errors = nmf_df['reconstruction_error'].values
         deltas = np.diff(errors)
@@ -531,58 +628,120 @@ def generate_tuning_report(
         suggested_n = int(nmf_df.iloc[best_idx + 1]['n_components'])
         lines.append(f"\n  Suggested n_components: {suggested_n} (elbow method)")
 
+        # Also suggest based on explained variance threshold (80%)
+        if has_explained_var:
+            above_80 = nmf_df[nmf_df['explained_variance'] >= 0.80]
+            if len(above_80) > 0:
+                min_n_80 = int(above_80['n_components'].min())
+                lines.append(f"  First n with ≥80% variance: {min_n_80}")
+
     lines.extend([
-        "\n" + "-" * 40,
-        "2. STABILITY (ARI) vs resolution",
-        "-" * 40,
+        "\n" + "-" * 50,
+        "2. LEIDEN: STABILITY (ARI across seeds)",
+        "-" * 50,
     ])
 
     for _, row in stability_df.iterrows():
-        lines.append(
-            f"  r={row['resolution']:.1f}  ARI={row['mean_ari']:.4f} ± {row['std_ari']:.4f}"
-        )
+        ari_str = f"ARI={row['mean_ari']:.4f} ± {row['std_ari']:.4f}"
+        stable_marker = " ✓" if row['mean_ari'] >= 0.9 else ""
+        lines.append(f"  r={row['resolution']:.2f}  {ari_str}{stable_marker}")
 
-    # Suggest resolution with highest stability
     best_stability = stability_df.loc[stability_df['mean_ari'].idxmax()]
-    lines.append(f"\n  Most stable resolution: {best_stability['resolution']:.1f} (ARI={best_stability['mean_ari']:.4f})")
+    lines.append(f"\n  Most stable: r={best_stability['resolution']:.2f} (ARI={best_stability['mean_ari']:.4f})")
 
     lines.extend([
-        "\n" + "-" * 40,
-        "3. CLUSTER COUNTS vs parameters",
-        "-" * 40,
+        "\n" + "-" * 50,
+        "3. CLUSTER QUALITY METRICS (Silhouette & Davies-Bouldin)",
+        "-" * 50,
+        "  (Higher Silhouette = better; Lower Davies-Bouldin = better)",
     ])
 
-    # Group by resolution to show range
+    # Check if quality metrics exist
+    has_silhouette = 'silhouette_score' in grid_df.columns
+
+    if has_silhouette:
+        # Show best configs by silhouette score
+        valid_sil = grid_df[grid_df['silhouette_score'].notna()].copy()
+        if len(valid_sil) > 0:
+            top_5 = valid_sil.nlargest(5, 'silhouette_score')
+            lines.append("\n  Top 5 configurations by Silhouette Score:")
+            for _, row in top_5.iterrows():
+                lines.append(
+                    f"    n={int(row['n_components'])}, k={int(row['n_neighbors'])}, "
+                    f"r={row['resolution']:.2f} -> sil={row['silhouette_score']:.4f}, "
+                    f"DB={row['davies_bouldin_score']:.4f}, clusters={int(row['n_clusters'])}"
+                )
+
+    lines.extend([
+        "\n" + "-" * 50,
+        "4. CLUSTER SIZE DISTRIBUTION",
+        "-" * 50,
+    ])
+
     for r in sorted(grid_df['resolution'].unique()):
         subset = grid_df[grid_df['resolution'] == r]
         n_clusters_range = f"{subset['n_clusters'].min()}-{subset['n_clusters'].max()}"
         min_size_range = f"{subset['min_cluster_size'].min()}-{subset['min_cluster_size'].max()}"
-        lines.append(f"  r={r:.1f}  n_clusters={n_clusters_range:>8}  min_size={min_size_range}")
+        lines.append(f"  r={r:.2f}  n_clusters={n_clusters_range:>8}  min_size={min_size_range}")
 
     lines.extend([
-        "\n" + "-" * 40,
-        "4. RECOMMENDATIONS",
-        "-" * 40,
+        "\n" + "-" * 50,
+        "5. FINAL RECOMMENDATIONS",
+        "-" * 50,
     ])
 
-    # Filter for reasonable cluster sizes (min >= 50)
-    good_configs = grid_df[grid_df['min_cluster_size'] >= 50]
-    if len(good_configs) > 0:
-        # Prefer higher stability resolutions
-        stable_r = best_stability['resolution']
-        matching = good_configs[good_configs['resolution'] == stable_r]
-        if len(matching) > 0:
-            rec = matching.iloc[0]
+    # Data-driven selection:
+    # 1. Filter: min_cluster_size >= 50
+    # 2. Filter: stable resolution (ARI >= 0.9 if available)
+    # 3. Rank by: silhouette score
+
+    good_configs = grid_df[grid_df['min_cluster_size'] >= 50].copy()
+
+    if len(good_configs) > 0 and has_silhouette:
+        # Filter for stable resolutions if stability data available
+        stable_resolutions = stability_df[stability_df['mean_ari'] >= 0.9]['resolution'].tolist()
+        if stable_resolutions:
+            stable_configs = good_configs[good_configs['resolution'].isin(stable_resolutions)]
+            if len(stable_configs) > 0:
+                good_configs = stable_configs
+
+        # Filter for valid silhouette scores
+        good_configs = good_configs[good_configs['silhouette_score'].notna()]
+
+        if len(good_configs) > 0:
+            # Rank by silhouette score
+            best = good_configs.loc[good_configs['silhouette_score'].idxmax()]
+
+            lines.append("  RECOMMENDED PARAMETERS:")
+            lines.append(f"    n_components: {int(best['n_components'])}")
+            lines.append(f"    n_neighbors:  {int(best['n_neighbors'])}")
+            lines.append(f"    resolution:   {best['resolution']:.2f}")
+            lines.append("")
+            lines.append("  Expected results:")
+            lines.append(f"    Clusters:         {int(best['n_clusters'])}")
+            lines.append(f"    Min cluster size: {int(best['min_cluster_size'])}")
+            lines.append(f"    Silhouette score: {best['silhouette_score']:.4f}")
+            lines.append(f"    Davies-Bouldin:   {best['davies_bouldin_score']:.4f}")
+
+            # Show command
+            lines.append("")
+            lines.append("  Run with:")
+            lines.append(f"    python nmf_leiden_clustering.py <input.csv> "
+                        f"-n {int(best['n_components'])} -k {int(best['n_neighbors'])} "
+                        f"-r {best['resolution']:.2f}")
         else:
-            # Fall back to first good config
-            rec = good_configs.iloc[0]
-        lines.append(f"  Recommended: n={int(rec['n_components'])}, k={int(rec['n_neighbors'])}, r={rec['resolution']:.1f}")
+            lines.append("  No configurations meet all criteria.")
+            lines.append("  Consider relaxing constraints or adjusting parameter ranges.")
+    elif len(good_configs) > 0:
+        # Fall back to basic recommendation without quality metrics
+        rec = good_configs.iloc[0]
+        lines.append(f"  Recommended: n={int(rec['n_components'])}, k={int(rec['n_neighbors'])}, r={rec['resolution']:.2f}")
         lines.append(f"    -> {int(rec['n_clusters'])} clusters, min size={int(rec['min_cluster_size'])}")
     else:
         lines.append("  No configurations with min_cluster_size >= 50 found.")
         lines.append("  Consider using lower resolution values.")
 
-    lines.append("\n" + "=" * 60)
+    lines.append("\n" + "=" * 70)
 
     return "\n".join(lines)
 
@@ -647,7 +806,8 @@ def run_pipeline(
     batch_size: int = 1024,
     n_neighbors: int = 15,
     chunksize: int = 100_000,
-    random_state: int = 42
+    random_state: int = 42,
+    normalize_by_fov_flag: bool = False
 ) -> pd.DataFrame:
     """
     Run the complete NMF + Leiden clustering pipeline.
@@ -661,6 +821,7 @@ def run_pipeline(
         n_neighbors: Number of neighbors for clustering
         chunksize: CSV loading chunk size
         random_state: Random seed
+        normalize_by_fov_flag: Whether to normalize by FOV-level composition
 
     Returns:
         DataFrame with clustering results
@@ -670,14 +831,21 @@ def run_pipeline(
     logger.info("=" * 60)
 
     # Step 1: Load data
-    logger.info("\n[Step 1/4] Loading data...")
+    logger.info("\n[Step 1/5] Loading data...")
     metadata_df, data_matrix, feature_names = load_data_chunked(
         input_file,
         chunksize=chunksize
     )
 
-    # Step 2: Run NMF
-    logger.info("\n[Step 2/4] Running NMF decomposition...")
+    # Step 2: Optional sample-level normalization
+    if normalize_by_fov_flag:
+        logger.info("\n[Step 2/5] Applying sample-level normalization...")
+        data_matrix = normalize_by_fov(metadata_df, data_matrix)
+    else:
+        logger.info("\n[Step 2/5] Skipping sample-level normalization")
+
+    # Step 3: Run NMF
+    logger.info("\n[Step 3/5] Running NMF decomposition...")
     W, H = run_minibatch_nmf(
         data_matrix,
         n_components=n_components,
@@ -688,8 +856,8 @@ def run_pipeline(
     # Free memory from original data matrix
     del data_matrix
 
-    # Step 3: Run Leiden clustering
-    logger.info("\n[Step 3/4] Running Leiden clustering...")
+    # Step 4: Run Leiden clustering
+    logger.info("\n[Step 4/5] Running Leiden clustering...")
     cluster_labels = run_leiden_clustering(
         W,
         resolution=resolution,
@@ -697,8 +865,8 @@ def run_pipeline(
         random_state=random_state
     )
 
-    # Step 4: Save results
-    logger.info("\n[Step 4/4] Saving results...")
+    # Step 5: Save results
+    logger.info("\n[Step 5/5] Saving results...")
     basename = Path(input_file).stem
     save_results(
         output_dir=output_dir,
@@ -792,6 +960,12 @@ def main():
         help='Random seed for reproducibility'
     )
 
+    parser.add_argument(
+        '--normalize-by-fov',
+        action='store_true',
+        help='Normalize cell composition by FOV-level mean to reduce sample-level bias'
+    )
+
     # Tuning mode arguments
     parser.add_argument(
         '--tune',
@@ -856,7 +1030,8 @@ def main():
             batch_size=args.batch_size,
             n_neighbors=args.n_neighbors,
             chunksize=args.chunksize,
-            random_state=args.seed
+            random_state=args.seed,
+            normalize_by_fov_flag=args.normalize_by_fov
         )
 
 
