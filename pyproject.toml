@@ -5,7 +5,7 @@ description = "Memory-efficient NMF decomposition and Leiden clustering for larg
 requires-python = ">=3.9,<3.13"
 dependencies = [
     "numpy>=1.24.0",
-    "pandas>=2.0.0",
+    "pandas>=2.0.0,<2.3.0",
     "scipy>=1.10.0",
     "scikit-learn>=1.3.0",
     "scanpy>=1.9.6",
