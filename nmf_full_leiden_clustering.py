@@ -640,7 +640,7 @@ def generate_tuning_report(
             lines.append("")
             lines.append("  Run with:")
             lines.append(
-                f"    python nmf_leiden_clustering.py <input.csv> "
+                f"    python nmf_full_leiden_clustering.py <input.csv> "
                 f"-n {int(best['n_components'])} -k {int(best['n_neighbors'])} "
                 f"-r {best['resolution']:.2f}"
             )

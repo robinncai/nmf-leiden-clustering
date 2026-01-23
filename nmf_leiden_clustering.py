@@ -213,7 +213,6 @@ def run_leiden_clustering(
 
     logger.info(f"Running Leiden clustering with resolution={resolution}...")
 
-    # Run Leiden clustering
     sc.tl.leiden(
         adata,
         resolution=resolution,
@@ -459,7 +458,7 @@ def run_tuning(
     """
     # Default parameter grids
     if n_components_list is None:
-        n_components_list = [5, 8, 10, 12, 15]
+        n_components_list = [5, 8, 10, 12, 15, 17, 19, 21, 23, 25, 27]
     if n_neighbors_list is None:
         n_neighbors_list = [10, 15, 20, 30]
     if resolution_list is None:
@@ -983,21 +982,21 @@ def main():
     parser.add_argument(
         '--tune-n',
         type=str,
-        default='5,8,10,12,15',
+        default=None,
         help='Comma-separated n_components values to try (default: 5,8,10,12,15)'
     )
 
     parser.add_argument(
         '--tune-k',
         type=str,
-        default='10,15,20,30',
+        default=None,
         help='Comma-separated n_neighbors values to try (default: 10,15,20,30)'
     )
 
     parser.add_argument(
         '--tune-r',
         type=str,
-        default='0.1,0.3,0.5,0.8,1.0',
+        default=None,
         help='Comma-separated resolution values to try (default: 0.1,0.3,0.5,0.8,1.0)'
     )
 
@@ -1013,9 +1012,9 @@ def main():
             input_file=args.input_file,
             output_dir=args.output_dir,
             n_subsample=args.tune_subsample,
-            n_components_list=parse_int_list(args.tune_n),
-            n_neighbors_list=parse_int_list(args.tune_k),
-            resolution_list=parse_float_list(args.tune_r),
+            n_components_list=parse_int_list(args.tune_n) if args.tune_n else None,
+            n_neighbors_list=parse_int_list(args.tune_k) if args.tune_k else None,
+            resolution_list=parse_float_list(args.tune_r) if args.tune_r else None,
             batch_size=args.batch_size,
             chunksize=args.chunksize,
             random_state=args.seed
