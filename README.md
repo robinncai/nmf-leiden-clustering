@@ -8,6 +8,8 @@ Memory-efficient NMF decomposition and Leiden clustering for large cell datasets
 - **MiniBatchNMF** - Processes NMF in mini-batches instead of loading full matrix
 - **Approximate nearest neighbors** - Scales to millions of cells using pynndescent
 - **float32 precision** - Halves memory usage compared to float64
+- **SVD analysis** - Determine effective dimensionality before NMF
+- **Batch-stratified subsampling** - Quick testing on representative data subsets
 
 ## Installation
 
@@ -63,7 +65,10 @@ python nmf_leiden_clustering.py input_file.csv \
 ```
 usage: nmf_leiden_clustering.py [-h] [-o OUTPUT_DIR] [-n N_COMPONENTS]
                                  [-r RESOLUTION] [-b BATCH_SIZE]
-                                 [-k N_NEIGHBORS] [-c CHUNKSIZE] [-s SEED]
+                                 [-k N_NEIGHBORS] [-c CHUNKSIZE]
+                                 [--subsample METADATA_CSV]
+                                 [--subsample-fraction FRACTION]
+                                 [-s SEED] [--svd]
                                  input_file
 
 positional arguments:
@@ -78,7 +83,10 @@ options:
   -b, --batch-size      Mini-batch size for NMF (default: 1024)
   -k, --n-neighbors     Number of neighbors for kNN graph (default: 15)
   -c, --chunksize       Chunk size for reading CSV (default: 100000)
+  --subsample           Path to metadata CSV for batch-stratified subsampling
+  --subsample-fraction  Fraction to sample from each batch (default: 0.1)
   -s, --seed            Random seed for reproducibility (default: 42)
+  --svd                 Run SVD analysis to determine effective dimensionality
 ```
 
 ## Input Format
@@ -100,6 +108,38 @@ fov,label,cell_meta_cluster,Cancer cell,Myeloid cell,Lymphocyte,Endothelial cell
 FOV_1,1,Cancer cell,0.45,0.15,0.10,0.10,0.15,0.05
 FOV_1,2,Myeloid cell,0.20,0.35,0.25,0.05,0.10,0.05
 ```
+
+## Batch-Stratified Subsampling
+
+For quick testing or experimentation, use `--subsample` to sample a fraction of data from each batch:
+
+```bash
+python nmf_leiden_clustering.py input_file.csv \
+    --subsample metadata.csv \
+    --subsample-fraction 0.1
+```
+
+This requires a metadata CSV with columns: `fov`, `label`, `batch`. The script will:
+1. Merge input data with metadata on (fov, label)
+2. Sample 10% (or specified fraction) from each unique batch value
+3. Run the pipeline on the subsampled data
+
+Rows without matching metadata are grouped as 'Unknown' batch.
+
+## SVD Analysis
+
+Use `--svd` to run SVD analysis before NMF. This helps determine the effective dimensionality of your data:
+
+```bash
+python nmf_full_leiden_clustering.py input_file.csv --svd -o results
+```
+
+The SVD analysis:
+- Computes singular values and explained variance ratios (in float64 for accuracy)
+- Suggests n_components based on 90%, 95%, 99% variance thresholds
+- Saves results to `*_svd_analysis.csv`
+
+This helps you choose an appropriate `--n-components` value rather than guessing.
 
 ## Output Files
 
@@ -151,7 +191,7 @@ python nmf_leiden_clustering.py input_file.csv --tune -o tuning_results
 ```bash
 python nmf_leiden_clustering.py input_file.csv --tune \
     --tune-subsample 200000 \
-    --tune-n "5,8,10,12,15" \
+    --tune-n "3,5,8,10" \
     --tune-k "10,15,20,30" \
     --tune-r "0.1,0.3,0.5,0.8,1.0" \
     -o tuning_results
@@ -160,7 +200,7 @@ python nmf_leiden_clustering.py input_file.csv --tune \
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--tune-subsample` | 200000 | Number of cells to subsample |
-| `--tune-n` | 5,8,10,12,15 | n_components values to try |
+| `--tune-n` | 3,5,8,10 | n_components values to try |
 | `--tune-k` | 10,15,20,30 | n_neighbors values to try |
 | `--tune-r` | 0.1,0.3,0.5,0.8,1.0 | resolution values to try |
 

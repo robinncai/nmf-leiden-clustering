@@ -17,11 +17,11 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.decomposition import NMF
+from sklearn.decomposition import NMF, TruncatedSVD
 from sklearn.metrics import adjusted_rand_score, silhouette_score, davies_bouldin_score
 import scanpy as sc
 import anndata as ad
@@ -107,6 +107,80 @@ def normalize_by_fov(
 
 
 # ---------------------------
+# SVD DIMENSIONALITY ANALYSIS
+# ---------------------------
+
+def run_svd_analysis(
+    X: np.ndarray,
+    max_components: int = None,
+    random_state: int = 42,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Run truncated SVD to analyze the effective dimensionality of the data.
+
+    SVD reveals the low-rank structure of the data and helps choose n_components
+    for NMF. The singular values and explained variance ratios indicate how many
+    components capture meaningful signal vs noise.
+
+    Args:
+        X: Input matrix (cells x features)
+        max_components: Maximum components to compute (default: min(n_samples, n_features) - 1)
+        random_state: Random seed for reproducibility
+
+    Returns:
+        singular_values: Array of singular values in descending order
+        explained_variance_ratio: Proportion of variance explained by each component (float64)
+        cumulative_variance: Cumulative variance explained (float64)
+    """
+    n_samples, n_features = X.shape
+    if max_components is None:
+        max_components = min(n_samples, n_features) - 1
+
+    # Cap at reasonable number for large datasets
+    max_components = min(max_components, 50)
+
+    logger.info(f"Running SVD analysis with up to {max_components} components...")
+
+    # Use float64 for accurate variance computation
+    X_64 = X.astype(np.float64)
+    X_centered = X_64 - X_64.mean(axis=0)
+
+    svd = TruncatedSVD(
+        n_components=max_components,
+        random_state=random_state,
+        algorithm="randomized",
+    )
+    svd.fit(X_centered)
+
+    singular_values = svd.singular_values_
+    explained_variance_ratio = svd.explained_variance_ratio_.astype(np.float64)
+    cumulative_variance = np.cumsum(explained_variance_ratio)
+
+    logger.info("SVD Analysis Results:")
+    logger.info("  Component | Singular Value | Var Explained | Cumulative Var")
+    logger.info("  " + "-" * 60)
+    for i in range(min(15, len(singular_values))):
+        logger.info(
+            f"  {i+1:9d} | {singular_values[i]:14.4f} | {explained_variance_ratio[i]:13.6f} | {cumulative_variance[i]:14.6f}"
+        )
+    if len(singular_values) > 15:
+        logger.info(f"  ... ({len(singular_values) - 15} more components)")
+
+    # Suggest n_components based on elbow/variance threshold
+    var_90 = np.searchsorted(cumulative_variance, 0.90) + 1
+    var_95 = np.searchsorted(cumulative_variance, 0.95) + 1
+    var_99 = np.searchsorted(cumulative_variance, 0.99) + 1
+
+    logger.info("")
+    logger.info("  Suggested n_components:")
+    logger.info(f"    90% variance: {var_90} components")
+    logger.info(f"    95% variance: {var_95} components")
+    logger.info(f"    99% variance: {var_99} components")
+
+    return singular_values, explained_variance_ratio, cumulative_variance
+
+
+# ---------------------------
 # REGULAR (FULL-BATCH) NMF
 # ---------------------------
 
@@ -166,10 +240,12 @@ def run_nmf_with_reconstruction_error(
     """
     Run regular NMF and return factor loadings with reconstruction error and explained variance.
 
+    Note: Explained variance is computed in float64 for numerical accuracy.
+
     Returns:
         W: Factor loadings matrix (cells x components)
         reconstruction_err: Frobenius norm of reconstruction error
-        explained_variance_ratio: Proportion of variance explained (0-1)
+        explained_variance_ratio: Proportion of variance explained (0-1), computed in float64
     """
     X_nn = np.clip(X, 0, None)
 
@@ -188,9 +264,14 @@ def run_nmf_with_reconstruction_error(
     W = model.fit_transform(X_nn)
     H = model.components_
 
-    reconstruction = W @ H
-    total_variance = np.sum(X_nn ** 2)
-    residual_variance = np.sum((X_nn - reconstruction) ** 2)
+    # Compute explained variance in float64 for numerical accuracy
+    X_64 = X_nn.astype(np.float64)
+    W_64 = W.astype(np.float64)
+    H_64 = H.astype(np.float64)
+
+    reconstruction = W_64 @ H_64
+    total_variance = np.sum(X_64 ** 2)
+    residual_variance = np.sum((X_64 - reconstruction) ** 2)
     explained_variance_ratio = 1.0 - (residual_variance / total_variance)
 
     return W.astype(np.float32), float(model.reconstruction_err_), float(explained_variance_ratio)
@@ -377,7 +458,7 @@ def run_tuning(
     Run hyperparameter tuning on a subsample of the data.
     """
     if n_components_list is None:
-        n_components_list = [5, 8, 10, 12, 15]
+        n_components_list = [3, 5, 8, 10]
     if n_neighbors_list is None:
         n_neighbors_list = [10, 15, 20, 30]
     if resolution_list is None:
@@ -709,6 +790,9 @@ def run_pipeline(
     chunksize: int = 100_000,
     random_state: int = 42,
     normalize_by_fov_flag: bool = False,
+    subsample_metadata_path: Optional[str] = None,
+    subsample_fraction: float = 0.1,
+    run_svd: bool = False,
 ) -> pd.DataFrame:
     """
     Run the complete NMF + Leiden clustering pipeline.
@@ -717,20 +801,52 @@ def run_pipeline(
     logger.info("NMF + Leiden Clustering Pipeline")
     logger.info("=" * 60)
 
-    logger.info("\n[Step 1/5] Loading data...")
-    metadata_df, data_matrix, feature_names = load_data_chunked(
-        input_file,
-        chunksize=chunksize,
-    )
+    # Step 1: Load data (with optional batch subsampling)
+    logger.info("\n[Step 1/6] Loading data...")
+    if subsample_metadata_path:
+        from input_data_sample import load_data_with_batch_subsample
+        logger.info(f"Batch-stratified subsampling enabled (fraction={subsample_fraction})")
+        metadata_df, data_matrix, feature_names = load_data_with_batch_subsample(
+            input_file,
+            subsample_metadata_path,
+            fraction=subsample_fraction,
+            chunksize=chunksize,
+            random_state=random_state,
+        )
+    else:
+        metadata_df, data_matrix, feature_names = load_data_chunked(
+            input_file,
+            chunksize=chunksize,
+        )
 
     if normalize_by_fov_flag:
-        logger.info("\n[Step 2/5] Applying sample-level normalization...")
+        logger.info("\n[Step 2/6] Applying sample-level normalization...")
         data_matrix = normalize_by_fov(metadata_df, data_matrix)
     else:
-        logger.info("\n[Step 2/5] Skipping sample-level normalization")
+        logger.info("\n[Step 2/6] Skipping sample-level normalization")
+
+    # Optional SVD analysis to determine effective dimensionality
+    if run_svd:
+        logger.info("\n[Step 3/6] Running SVD analysis...")
+        singular_values, explained_var, cumulative_var = run_svd_analysis(
+            data_matrix, random_state=random_state
+        )
+        # Save SVD results
+        os.makedirs(output_dir, exist_ok=True)
+        svd_df = pd.DataFrame({
+            "component": range(1, len(singular_values) + 1),
+            "singular_value": singular_values,
+            "explained_variance": explained_var,
+            "cumulative_variance": cumulative_var,
+        })
+        svd_path = os.path.join(output_dir, f"{Path(input_file).stem}_svd_analysis.csv")
+        svd_df.to_csv(svd_path, index=False)
+        logger.info(f"SVD results saved to {svd_path}")
+    else:
+        logger.info("\n[Step 3/6] Skipping SVD analysis (use --svd to enable)")
 
     logger.info(
-        "\n[Step 3/5] Running NMF decomposition (regular full-batch NMF)..."
+        "\n[Step 4/6] Running NMF decomposition (regular full-batch NMF)..."
     )
     if batch_size is not None:
         logger.info("  Note: --batch-size is ignored for regular NMF.")
@@ -746,7 +862,7 @@ def run_pipeline(
 
     del data_matrix
 
-    logger.info("\n[Step 4/5] Running Leiden clustering...")
+    logger.info("\n[Step 5/6] Running Leiden clustering...")
     cluster_labels = run_leiden_clustering(
         W,
         resolution=resolution,
@@ -754,7 +870,7 @@ def run_pipeline(
         random_state=random_state,
     )
 
-    logger.info("\n[Step 5/5] Saving results...")
+    logger.info("\n[Step 6/6] Saving results...")
     basename = Path(input_file).stem
     save_results(
         output_dir=output_dir,
@@ -825,12 +941,34 @@ def main():
         "-c", "--chunksize", type=int, default=100_000, help="Chunk size for reading CSV"
     )
 
+    parser.add_argument(
+        "--subsample",
+        type=str,
+        default=None,
+        metavar="METADATA_CSV",
+        help="Enable batch-stratified subsampling. Path to metadata CSV with fov, label, batch columns.",
+    )
+
+    parser.add_argument(
+        "--subsample-fraction",
+        type=float,
+        default=0.1,
+        help="Fraction of data to sample from each batch (default: 0.1 = 10%%). Only used with --subsample.",
+    )
+
     parser.add_argument("-s", "--seed", type=int, default=42, help="Random seed for reproducibility")
 
     parser.add_argument(
         "--normalize-by-fov",
         action="store_true",
         help="Normalize cell composition by FOV-level mean to reduce sample-level bias",
+    )
+
+    # SVD analysis
+    parser.add_argument(
+        "--svd",
+        action="store_true",
+        help="Run SVD analysis to determine effective dimensionality before NMF. Helps choose n_components.",
     )
 
     # Tuning mode
@@ -850,8 +988,8 @@ def main():
     parser.add_argument(
         "--tune-n",
         type=str,
-        default="5,8,10,12,15",
-        help="Comma-separated n_components values to try (default: 5,8,10,12,15)",
+        default="3,5,8,10",
+        help="Comma-separated n_components values to try (default: 3,5,8,10)",
     )
 
     parser.add_argument(
@@ -872,6 +1010,14 @@ def main():
 
     if not os.path.exists(args.input_file):
         logger.error(f"Input file not found: {args.input_file}")
+        sys.exit(1)
+
+    if args.subsample and not os.path.exists(args.subsample):
+        logger.error(f"Metadata file not found: {args.subsample}")
+        sys.exit(1)
+
+    if args.subsample_fraction <= 0 or args.subsample_fraction > 1:
+        logger.error("--subsample-fraction must be between 0 and 1")
         sys.exit(1)
 
     if args.tune:
@@ -896,6 +1042,9 @@ def main():
             chunksize=args.chunksize,
             random_state=args.seed,
             normalize_by_fov_flag=args.normalize_by_fov,
+            subsample_metadata_path=args.subsample,
+            subsample_fraction=args.subsample_fraction,
+            run_svd=args.svd,
         )
 
 

@@ -17,7 +17,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import json
 
 import numpy as np
@@ -806,7 +806,9 @@ def run_pipeline(
     n_neighbors: int = 15,
     chunksize: int = 100_000,
     random_state: int = 42,
-    normalize_by_fov_flag: bool = False
+    normalize_by_fov_flag: bool = False,
+    subsample_metadata_path: Optional[str] = None,
+    subsample_fraction: float = 0.1
 ) -> pd.DataFrame:
     """
     Run the complete NMF + Leiden clustering pipeline.
@@ -829,12 +831,23 @@ def run_pipeline(
     logger.info("NMF + Leiden Clustering Pipeline")
     logger.info("=" * 60)
 
-    # Step 1: Load data
+    # Step 1: Load data (with optional batch subsampling)
     logger.info("\n[Step 1/5] Loading data...")
-    metadata_df, data_matrix, feature_names = load_data_chunked(
-        input_file,
-        chunksize=chunksize
-    )
+    if subsample_metadata_path:
+        from input_data_sample import load_data_with_batch_subsample
+        logger.info(f"Batch-stratified subsampling enabled (fraction={subsample_fraction})")
+        metadata_df, data_matrix, feature_names = load_data_with_batch_subsample(
+            input_file,
+            subsample_metadata_path,
+            fraction=subsample_fraction,
+            chunksize=chunksize,
+            random_state=random_state
+        )
+    else:
+        metadata_df, data_matrix, feature_names = load_data_chunked(
+            input_file,
+            chunksize=chunksize
+        )
 
     # Step 2: Optional sample-level normalization
     if normalize_by_fov_flag:
@@ -953,6 +966,21 @@ def main():
     )
 
     parser.add_argument(
+        '--subsample',
+        type=str,
+        default=None,
+        metavar='METADATA_CSV',
+        help='Enable batch-stratified subsampling. Path to metadata CSV with fov, label, batch columns.'
+    )
+
+    parser.add_argument(
+        '--subsample-fraction',
+        type=float,
+        default=0.1,
+        help='Fraction of data to sample from each batch (default: 0.1 = 10%%). Only used with --subsample.'
+    )
+
+    parser.add_argument(
         '-s', '--seed',
         type=int,
         default=42,
@@ -1006,6 +1034,14 @@ def main():
         logger.error(f"Input file not found: {args.input_file}")
         sys.exit(1)
 
+    if args.subsample and not os.path.exists(args.subsample):
+        logger.error(f"Metadata file not found: {args.subsample}")
+        sys.exit(1)
+
+    if args.subsample_fraction <= 0 or args.subsample_fraction > 1:
+        logger.error("--subsample-fraction must be between 0 and 1")
+        sys.exit(1)
+
     if args.tune:
         # Tuning mode
         run_tuning(
@@ -1030,7 +1066,9 @@ def main():
             n_neighbors=args.n_neighbors,
             chunksize=args.chunksize,
             random_state=args.seed,
-            normalize_by_fov_flag=args.normalize_by_fov
+            normalize_by_fov_flag=args.normalize_by_fov,
+            subsample_metadata_path=args.subsample,
+            subsample_fraction=args.subsample_fraction
         )
 
 
