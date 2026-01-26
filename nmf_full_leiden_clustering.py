@@ -396,7 +396,13 @@ def run_leiden_with_labels(
     return adata.obs["leiden"].values.astype(int)
 
 
-def compute_cluster_stats(labels: np.ndarray, factor_matrix: np.ndarray = None) -> Dict:
+def compute_cluster_stats(
+    labels: np.ndarray,
+    factor_matrix: np.ndarray = None,
+    compute_silhouette: bool = True,
+    silhouette_n: int = 0,
+    silhouette_seed: int = 42,
+) -> Dict:
     """Compute cluster statistics and quality metrics."""
     unique, counts = np.unique(labels, return_counts=True)
 
@@ -405,19 +411,39 @@ def compute_cluster_stats(labels: np.ndarray, factor_matrix: np.ndarray = None) 
         "min_cluster_size": int(counts.min()),
         "max_cluster_size": int(counts.max()),
         "median_cluster_size": int(np.median(counts)),
-        "cluster_sizes": {int(k): int(v) for k, v in zip(unique, counts)},
     }
 
-    if factor_matrix is not None and len(unique) > 1:
-        try:
-            stats["silhouette_score"] = float(silhouette_score(factor_matrix, labels))
-            stats["davies_bouldin_score"] = float(davies_bouldin_score(factor_matrix, labels))
-        except Exception:
-            stats["silhouette_score"] = None
-            stats["davies_bouldin_score"] = None
-    else:
-        stats["silhouette_score"] = None
+    # Default metrics
+    stats["silhouette_score"] = None
+    stats["davies_bouldin_score"] = None
+    stats["silhouette_n"] = None  # record how many points used
+
+    if factor_matrix is None or len(unique) <= 1:
+        return stats
+
+    # Davies-Bouldin is relatively cheap
+    try:
+        stats["davies_bouldin_score"] = float(davies_bouldin_score(factor_matrix, labels))
+    except Exception:
         stats["davies_bouldin_score"] = None
+
+    # Silhouette can be very expensive; optionally subsample
+    if not compute_silhouette:
+        return stats
+
+    try:
+        n = factor_matrix.shape[0]
+        if silhouette_n and silhouette_n < n:
+            rng = np.random.default_rng(silhouette_seed)
+            idx = rng.choice(n, size=silhouette_n, replace=False)
+            stats["silhouette_score"] = float(silhouette_score(factor_matrix[idx], labels[idx]))
+            stats["silhouette_n"] = int(silhouette_n)
+        else:
+            stats["silhouette_score"] = float(silhouette_score(factor_matrix, labels))
+            stats["silhouette_n"] = int(n)
+    except Exception:
+        stats["silhouette_score"] = None
+        stats["silhouette_n"] = None
 
     return stats
 
@@ -453,16 +479,19 @@ def run_tuning(
     stability_seeds: List[int] = None,
     chunksize: int = 100_000,
     random_state: int = 42,
+    compute_silhouette: bool = True,
+    silhouette_n: int = 20000,
+    silhouette_seed: int = 42,
 ) -> pd.DataFrame:
     """
     Run hyperparameter tuning on a subsample of the data.
     """
     if n_components_list is None:
-        n_components_list = [3, 5, 8, 10]
+        n_components_list = [2, 3, 4, 5, 6, 7, 8]
     if n_neighbors_list is None:
-        n_neighbors_list = [10, 15, 20, 30]
+        n_neighbors_list = [10, 20, 30, 40, 50, 60]
     if resolution_list is None:
-        resolution_list = [0.1, 0.3, 0.5, 0.8, 1.0]
+        resolution_list = [0.01, 0.1, 0.3, 0.5, 0.8, 1.0]
     if stability_seeds is None:
         stability_seeds = [42, 123, 456, 789, 1011]
 
@@ -519,7 +548,10 @@ def run_tuning(
                 logger.info(f"  [{combo_idx}/{total_combos}] n={n}, k={k}, r={r}")
 
                 labels = run_leiden_with_labels(W, r, k, random_state)
-                stats = compute_cluster_stats(labels, W)
+                stats = compute_cluster_stats(labels, W,
+                                              compute_silhouette=compute_silhouette,
+                                                silhouette_n=silhouette_n,
+                                                silhouette_seed=silhouette_seed,)
 
                 result = {
                     "n_components": n,
@@ -530,6 +562,7 @@ def run_tuning(
                     "max_cluster_size": stats["max_cluster_size"],
                     "median_cluster_size": stats["median_cluster_size"],
                     "silhouette_score": stats["silhouette_score"],
+                    "silhouette_n": stats["silhouette_n"],
                     "davies_bouldin_score": stats["davies_bouldin_score"],
                 }
                 grid_results.append(result)
@@ -1006,6 +1039,19 @@ def main():
         help="Comma-separated resolution values to try (default: 0.1,0.3,0.5,0.8,1.0)",
     )
 
+    parser.add_argument(
+        "--no-silhouette",
+        action="store_true",
+        help="Disable silhouette score computation (saves time).",
+    )
+
+    parser.add_argument(
+        "--silhouette-n",
+        type=int,
+        default=20000,
+        help="Compute silhouette on a random subset of N cells (0 = all cells).",
+    )
+
     args = parser.parse_args()
 
     if not os.path.exists(args.input_file):
@@ -1030,6 +1076,9 @@ def main():
             resolution_list=parse_float_list(args.tune_r),
             chunksize=args.chunksize,
             random_state=args.seed,
+            compute_silhouette=(not args.no_silhouette),
+            silhouette_n=args.silhouette_n,
+            silhouette_seed=args.seed,
         )
     else:
         run_pipeline(
