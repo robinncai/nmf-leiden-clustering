@@ -489,7 +489,7 @@ def run_tuning(
     if n_components_list is None:
         n_components_list = [2, 3, 4, 5, 6, 7, 8]
     if n_neighbors_list is None:
-        n_neighbors_list = [10, 20, 30, 40, 50, 60]
+        n_neighbors_list = [50, 70, 90, 110, 130]
     if resolution_list is None:
         resolution_list = [0.01, 0.1, 0.3, 0.5, 0.8, 1.0]
     if stability_seeds is None:
@@ -946,7 +946,7 @@ def main():
     parser.add_argument("-o", "--output-dir", default="results", help="Output directory for results")
 
     parser.add_argument(
-        "-n", "--n-components", type=int, default=10, help="Number of NMF components/factors"
+        "-n", "--n-components", type=int, default=5, help="Number of NMF components/factors"
     )
 
     parser.add_argument(
@@ -967,7 +967,7 @@ def main():
     )
 
     parser.add_argument(
-        "-k", "--n-neighbors", type=int, default=15, help="Number of neighbors for kNN graph"
+        "-k", "--n-neighbors", type=int, default=100, help="Number of neighbors for kNN graph"
     )
 
     parser.add_argument(
