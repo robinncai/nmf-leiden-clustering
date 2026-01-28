@@ -34,6 +34,7 @@ test_plots/
 results_no_norm/
 results_with_norm/
 log/
+results/
 
 # IDE
 .idea/
