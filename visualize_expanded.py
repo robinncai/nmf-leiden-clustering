@@ -10,11 +10,18 @@ Generates UMAP embeddings and diagnostic plots for:
 NEW:
 - Optional PCA->UMAP on normalized feature columns in the same CSV
   (select features by prefix or explicit column list)
+- Optional spatial overlay visualizations (cell type vs cluster assignments)
+
+Dependencies:
+- ark-analysis v0.7.2 (for spatial overlays)
+  Install: git clone -b v0.7.2 https://github.com/angelolab/ark-analysis.git
+           cd ark-analysis && conda env create -f environment.yml
 """
 
 import argparse
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -22,6 +29,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import seaborn as sns
 import scanpy as sc
 import anndata as ad
 
@@ -33,6 +41,24 @@ logger = logging.getLogger(__name__)
 
 # Use a clean style
 plt.style.use('seaborn-v0_8-whitegrid')
+
+# Optional imports for spatial overlay functionality
+# Add parent directories to path to find phenotype_mask_utils
+SPATIAL_OVERLAYS_AVAILABLE = False
+try:
+    # Add KMEANS directory to path to import phenotype_mask_utils
+    kmeans_dir = Path(__file__).resolve().parent.parent / 'pan_cancer_subtype' / 'KMEANS'
+    if kmeans_dir.exists():
+        sys.path.insert(0, str(kmeans_dir))
+
+    from phenotype_mask_utils import generate_and_save_phenotype_masks
+    from ark.utils import data_utils, load_utils
+    SPATIAL_OVERLAYS_AVAILABLE = True
+    logger.info("Spatial overlay functionality available (ark-analysis detected)")
+except ImportError as e:
+    logger.debug(f"Spatial overlay functionality not available: {e}")
+    logger.debug("To enable spatial overlays, install ark-analysis v0.7.2")
+    SPATIAL_OVERLAYS_AVAILABLE = False
 
 
 def compute_umap(
@@ -347,6 +373,258 @@ def plot_small_multiples(
     logger.info(f"Saved: {output_path}")
 
 
+def plot_cluster_celltype_heatmap(
+    cluster_df: pd.DataFrame,
+    output_path: str,
+    cluster_col: str = 'leiden_cluster',
+    celltype_col: str = 'cell_meta_cluster',
+    figsize: Tuple[int, int] = (12, 8),
+    cmap: str = 'viridis',
+    annot: bool = True,
+    fmt: str = '.2f'
+) -> None:
+    """
+    Create a heatmap showing average cell type frequency for each cluster.
+
+    Args:
+        cluster_df: DataFrame with cluster and cell type columns
+        output_path: Path to save the heatmap
+        cluster_col: Column name for cluster labels
+        celltype_col: Column name for cell type labels
+        figsize: Figure size (width, height)
+        cmap: Colormap for heatmap
+        annot: Whether to annotate cells with values
+        fmt: Format string for annotations
+    """
+    logger.info(f"Creating cluster-celltype composition heatmap...")
+
+    # Calculate cell type frequencies for each cluster
+    # Create a crosstab showing counts
+    composition = pd.crosstab(
+        cluster_df[cluster_col],
+        cluster_df[celltype_col],
+        normalize='index'  # Normalize by row (cluster) to get frequencies
+    )
+
+    # Sort clusters and cell types for better visualization
+    composition = composition.sort_index(axis=0)  # Sort clusters
+    composition = composition.sort_index(axis=1)  # Sort cell types
+
+    logger.info(f"Composition matrix shape: {composition.shape[0]} clusters x {composition.shape[1]} cell types")
+
+    # Create heatmap
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Determine annotation based on matrix size
+    if composition.shape[0] * composition.shape[1] > 500:
+        annot_flag = False
+        logger.info("Large matrix detected, disabling cell annotations")
+    else:
+        annot_flag = annot
+
+    sns.heatmap(
+        composition,
+        cmap=cmap,
+        annot=annot_flag,
+        fmt=fmt,
+        cbar_kws={'label': 'Frequency'},
+        ax=ax,
+        linewidths=0.5 if composition.shape[0] < 30 else 0,
+        linecolor='white' if composition.shape[0] < 30 else None
+    )
+
+    ax.set_xlabel('Cell Type', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Cluster', fontsize=12, fontweight='bold')
+    ax.set_title('Cell Type Composition by Cluster', fontsize=14, fontweight='bold', pad=20)
+
+    # Rotate x-axis labels for better readability
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Saved cluster-celltype heatmap: {output_path}")
+
+    # Also save the composition matrix as CSV
+    csv_path = output_path.replace('.png', '_composition.csv')
+    composition.to_csv(csv_path)
+    logger.info(f"Saved composition matrix: {csv_path}")
+
+
+# ============================================================================
+# SPATIAL OVERLAY VISUALIZATION
+# ============================================================================
+
+def plot_spatial_overlay_comparison(
+    phenotype_img,
+    cluster_img,
+    fov: str,
+    save_dir: str,
+    cell_table: pd.DataFrame,
+    phenotype_cmap: str = 'tab20',
+    cluster_cmap: str = 'tab20'
+) -> None:
+    """
+    Create side-by-side comparison of cell type vs cluster spatial distribution.
+
+    Args:
+        phenotype_img: xarray image with phenotype mask
+        cluster_img: xarray image with cluster mask
+        fov: FOV identifier
+        save_dir: Directory to save plot
+        cell_table: Cell table with metadata for cluster counts
+        phenotype_cmap: Colormap for phenotype (default: tab20)
+        cluster_cmap: Colormap for clusters (default: tab20)
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+
+    # Extract arrays from xarray
+    phenotype_data = phenotype_img.sel(fovs=fov).values.squeeze()
+    cluster_data = cluster_img.sel(fovs=fov).values.squeeze()
+
+    # Get number of unique values for colormaps
+    n_phenotypes = len(np.unique(phenotype_data[phenotype_data > 0]))
+    n_clusters = len(np.unique(cluster_data[cluster_data > 0]))
+
+    # Plot phenotype
+    im1 = axes[0].imshow(phenotype_data, cmap=phenotype_cmap, interpolation='nearest')
+    axes[0].set_title(f'{fov}\nCell Type (Phenotype)', fontsize=12, fontweight='bold')
+    axes[0].axis('off')
+    cbar1 = plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+    cbar1.set_label('Cell Type', rotation=270, labelpad=20)
+
+    # Plot leiden cluster
+    im2 = axes[1].imshow(cluster_data, cmap=cluster_cmap, interpolation='nearest')
+
+    # Get cluster statistics for this FOV
+    fov_cells = cell_table[cell_table['fov'] == fov]
+    n_cells = len(fov_cells)
+    cluster_counts = fov_cells['leiden_cluster'].value_counts().to_dict()
+    cluster_summary = f"n={n_cells:,} cells, {n_clusters} clusters"
+
+    axes[1].set_title(f'{fov}\nLeiden Cluster\n({cluster_summary})', fontsize=12, fontweight='bold')
+    axes[1].axis('off')
+    cbar2 = plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+    cbar2.set_label('Cluster ID', rotation=270, labelpad=20)
+
+    plt.tight_layout()
+    output_path = os.path.join(save_dir, f'{fov}_phenotype_vs_cluster.png')
+    fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Saved spatial overlay: {output_path}")
+
+
+def generate_spatial_overlays(
+    cluster_df: pd.DataFrame,
+    seg_dir: str,
+    output_dir: str,
+    specified_fovs: List[str],
+    cell_type_col: str = 'cell_meta_cluster'
+) -> None:
+    """
+    Generate spatial overlay visualizations for specified FOVs.
+
+    Args:
+        cluster_df: DataFrame with fov, label, leiden_cluster, cell_meta_cluster columns
+        seg_dir: Path to segmentation masks directory
+        output_dir: Directory to save overlays
+        specified_fovs: List of FOV identifiers to visualize
+        cell_type_col: Column name for cell type labels (default: cell_meta_cluster)
+    """
+    if not SPATIAL_OVERLAYS_AVAILABLE:
+        logger.error("Spatial overlay functionality not available. Install ark-analysis v0.7.2")
+        logger.error("Installation: git clone -b v0.7.2 https://github.com/angelolab/ark-analysis.git")
+        logger.error("              cd ark-analysis && conda env create -f environment.yml")
+        return
+
+    logger.info(f"Generating spatial overlays for {len(specified_fovs)} FOVs...")
+
+    # Create output directory
+    overlay_dir = os.path.join(output_dir, 'spatial_overlays')
+    os.makedirs(overlay_dir, exist_ok=True)
+
+    # Filter to specified FOVs
+    fov_data = cluster_df[cluster_df['fov'].isin(specified_fovs)].copy()
+
+    if len(fov_data) == 0:
+        logger.warning(f"No cells found for specified FOVs: {specified_fovs}")
+        return
+
+    logger.info(f"Found {len(fov_data):,} cells across {len(specified_fovs)} FOVs")
+
+    # Generate phenotype masks
+    logger.info("Generating phenotype masks...")
+    generate_and_save_phenotype_masks(
+        fovs=specified_fovs,
+        save_dir=overlay_dir,
+        seg_dir=seg_dir,
+        cell_table=fov_data,
+        cell_type_col=cell_type_col,
+        name_suffix='_phenotype_mask'
+    )
+
+    # Generate Leiden cluster masks
+    logger.info("Generating Leiden cluster masks...")
+    # Note: Assumes neighborhood_data has 'kmeans_cluster' column - we need to rename
+    fov_data_for_mask = fov_data.copy()
+    fov_data_for_mask['kmeans_cluster'] = fov_data_for_mask['leiden_cluster']
+
+    data_utils.generate_and_save_neighborhood_cluster_masks(
+        fovs=specified_fovs,
+        save_dir=overlay_dir,
+        seg_dir=seg_dir,
+        neighborhood_data=fov_data_for_mask,
+        name_suffix='_leiden_cluster_mask'
+    )
+
+    # Generate comparison plots
+    logger.info("Generating side-by-side comparison plots...")
+    for fov in specified_fovs:
+        try:
+            # Load phenotype mask
+            phenotype_mask = load_utils.load_imgs_from_dir(
+                data_dir=overlay_dir,
+                files=[f'{fov}_phenotype_mask.tiff'],
+                trim_suffix='_phenotype_mask',
+                match_substring='_phenotype_mask',
+                xr_dim_name='phenotype_mask',
+                xr_channel_names=None
+            )
+
+            # Load cluster mask
+            cluster_mask = load_utils.load_imgs_from_dir(
+                data_dir=overlay_dir,
+                files=[f'{fov}_leiden_cluster_mask.tiff'],
+                trim_suffix='_leiden_cluster_mask',
+                match_substring='_leiden_cluster_mask',
+                xr_dim_name='leiden_cluster_mask',
+                xr_channel_names=None
+            )
+
+            # Create comparison plot
+            plot_spatial_overlay_comparison(
+                phenotype_img=phenotype_mask,
+                cluster_img=cluster_mask,
+                fov=fov,
+                save_dir=overlay_dir,
+                cell_table=fov_data,
+                phenotype_cmap='tab20',
+                cluster_cmap='tab20'
+            )
+
+        except Exception as e:
+            logger.error(f"Error generating overlay for FOV {fov}: {e}")
+            continue
+
+    # Save FOV list
+    fov_list_path = os.path.join(overlay_dir, 'visualized_fovs.txt')
+    with open(fov_list_path, 'w') as f:
+        f.write('\n'.join(specified_fovs))
+    logger.info(f"Saved FOV list to {fov_list_path}")
+
+    logger.info(f"Spatial overlays complete! Results saved to {overlay_dir}")
+
+
 def run_visualization(
     cluster_results_path: str,
     metadata_path: Optional[str] = None,
@@ -360,10 +638,21 @@ def run_visualization(
     pca_feature_prefix: Optional[str] = None,
     pca_feature_cols: Optional[List[str]] = None,
     pca_n_comps: int = 50,
-    pca_scale: bool = True
+    pca_scale: bool = True,
+    # Spatial overlay parameters
+    generate_spatial_overlays: bool = False,
+    seg_dir: Optional[str] = None,
+    spatial_fovs: Optional[List[str]] = None,
+    cell_type_col: str = 'cell_meta_cluster'
 ) -> None:
     """
     Run full visualization pipeline.
+
+    New parameters:
+        generate_spatial_overlays: Enable spatial overlay visualization
+        seg_dir: Path to segmentation masks (required if generate_spatial_overlays=True)
+        spatial_fovs: List of FOV IDs to visualize (required if generate_spatial_overlays=True)
+        cell_type_col: Column name for cell type annotations (default: cell_meta_cluster)
     """
     logger.info("=" * 60)
     logger.info("Visualization Pipeline")
@@ -466,6 +755,28 @@ def run_visualization(
                 point_size=point_size
             )
 
+    # ---- Cluster-Celltype Composition Heatmap ----
+    logger.info("\n[Step 5.5] Generating cluster-celltype composition heatmap...")
+    if cell_type_col in df.columns:
+        # Calculate appropriate figure size based on number of clusters and cell types
+        n_clusters = df['leiden_cluster'].nunique()
+        n_celltypes = df[cell_type_col].nunique()
+        figsize_width = max(12, min(20, n_celltypes * 0.6))
+        figsize_height = max(8, min(16, n_clusters * 0.4))
+
+        plot_cluster_celltype_heatmap(
+            cluster_df=df,
+            output_path=os.path.join(output_dir, f'{basename}_cluster_celltype_heatmap.png'),
+            cluster_col='leiden_cluster',
+            celltype_col=cell_type_col,
+            figsize=(figsize_width, figsize_height),
+            cmap='viridis',
+            annot=True,
+            fmt='.2f'
+        )
+    else:
+        logger.warning(f"Cell type column '{cell_type_col}' not found in data. Skipping heatmap.")
+
     # ---- PCA UMAP (optional) ----
     if do_pca_umap:
         logger.info("\n[Step 6] Computing PCA-based UMAP embedding...")
@@ -541,6 +852,27 @@ def run_visualization(
                     title="UMAP (PCA space) colored by Subtype",
                     point_size=point_size
                 )
+
+    # ---- Spatial Overlays (optional) ----
+    if generate_spatial_overlays:
+        if not SPATIAL_OVERLAYS_AVAILABLE:
+            logger.warning("Spatial overlay functionality not available")
+            logger.warning("Install ark-analysis v0.7.2 to enable spatial overlays")
+        elif seg_dir is None:
+            logger.warning("Segmentation directory (--seg-dir) required for spatial overlays")
+        elif not os.path.exists(seg_dir):
+            logger.warning(f"Segmentation directory not found: {seg_dir}")
+        elif spatial_fovs is None or len(spatial_fovs) == 0:
+            logger.warning("No FOVs specified for spatial overlays (use --spatial-fovs)")
+        else:
+            logger.info("\n[Step 6] Generating spatial overlay visualizations...")
+            generate_spatial_overlays(
+                cluster_df=df,
+                seg_dir=seg_dir,
+                output_dir=output_dir,
+                specified_fovs=spatial_fovs,
+                cell_type_col=cell_type_col
+            )
 
     logger.info("\n" + "=" * 60)
     logger.info("Visualization complete!")
@@ -645,6 +977,32 @@ def main():
     )
     parser.set_defaults(pca_scale=True)
 
+    # ---- Spatial overlay options ----
+    parser.add_argument(
+        '--spatial-overlays',
+        action='store_true',
+        help='Generate spatial overlay visualizations (requires --seg-dir and --spatial-fovs)'
+    )
+
+    parser.add_argument(
+        '--seg-dir',
+        default=None,
+        help='Path to segmentation masks directory (required for spatial overlays)'
+    )
+
+    parser.add_argument(
+        '--spatial-fovs',
+        nargs='+',
+        default=None,
+        help='FOV IDs to visualize as spatial overlays (e.g., TONIC_TMA10_R3C3 TONIC_TMA10_R3C4)'
+    )
+
+    parser.add_argument(
+        '--cell-type-col',
+        default='cell_meta_cluster',
+        help='Column name for cell type annotations (default: cell_meta_cluster)'
+    )
+
     args = parser.parse_args()
 
     if not os.path.exists(args.cluster_results):
@@ -668,7 +1026,11 @@ def main():
         pca_feature_prefix=args.pca_feature_prefix,
         pca_feature_cols=pca_cols,
         pca_n_comps=args.pca_n_comps,
-        pca_scale=args.pca_scale
+        pca_scale=args.pca_scale,
+        generate_spatial_overlays=args.spatial_overlays,
+        seg_dir=args.seg_dir,
+        spatial_fovs=args.spatial_fovs,
+        cell_type_col=args.cell_type_col
     )
 
 

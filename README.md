@@ -336,6 +336,139 @@ python visualize.py cluster_results.csv \
 - Fragmented clusters split across UMAP (may need different parameters)
 - Bridges between clusters (may be over-split)
 
+## Spatial Overlay Visualization
+
+The `visualize_expanded.py` script supports spatial overlay visualization, allowing you to see how Leiden clusters correspond to spatial tissue organization and cell type distributions.
+
+### Prerequisites for Spatial Overlays
+
+#### Install ark-analysis v0.7.2
+
+```bash
+cd /scratch/groups/sartandi/rcai2/projects/
+git clone -b v0.7.2 https://github.com/angelolab/ark-analysis.git
+cd ark-analysis
+conda env create -f environment.yml
+conda activate ark-analysis
+```
+
+#### Ensure phenotype_mask_utils.py is available
+
+The script automatically looks for `phenotype_mask_utils.py` in the adjacent `pan_cancer_subtype/KMEANS/` directory.
+
+### Usage
+
+#### Basic Example: Generate UMAP plots only
+
+```bash
+python visualize_expanded.py \
+    results/neighborhood_freqs-cell_meta_cluster_radius200_nmf_leiden_clusters.csv \
+    --metadata ../pan_cancer_subtype/KMEANS/data/harmonized_full_with_metadata.csv \
+    --output-dir plots/
+```
+
+#### Add spatial overlays for specific FOVs
+
+```bash
+python visualize_expanded.py \
+    results/neighborhood_freqs-cell_meta_cluster_radius200_nmf_leiden_clusters.csv \
+    --metadata ../pan_cancer_subtype/KMEANS/data/harmonized_full_with_metadata.csv \
+    --output-dir plots/ \
+    --spatial-overlays \
+    --seg-dir /oak/stanford/groups/ccurtis2/users/syparkmd/Projects/TONIC/Data_from_Noah/deepcell_output \
+    --spatial-fovs TONIC_TMA10_R3C3 TONIC_TMA10_R3C4 TONIC_TMA10_R7C1
+```
+
+### Spatial Overlay Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--spatial-overlays` | Optional | Enable spatial overlay visualization |
+| `--seg-dir` | Required* | Path to segmentation masks directory |
+| `--spatial-fovs` | Required* | Space-separated list of FOV IDs to visualize |
+| `--cell-type-col` | Optional | Column name for cell type annotations (default: `cell_meta_cluster`) |
+
+*Required only if `--spatial-overlays` is enabled
+
+### Spatial Overlay Output Files
+
+When spatial overlays are generated, the following files are created in `<output_dir>/spatial_overlays/`:
+
+**For each FOV:**
+- `<FOV>_phenotype_vs_cluster.png` - Side-by-side comparison showing:
+  - **Left panel**: Cell types (phenotype) in spatial context
+  - **Right panel**: Leiden cluster assignments in spatial context
+- `<FOV>_phenotype_mask.tiff` - Spatial mask colored by cell type
+- `<FOV>_leiden_cluster_mask.tiff` - Spatial mask colored by cluster ID
+
+**Summary file:**
+- `visualized_fovs.txt` - List of FOVs that were visualized
+
+### Example Workflow with Spatial Overlays
+
+#### 1. Run NMF-Leiden clustering
+```bash
+python nmf_full_leiden_clustering.py \
+    input_data.csv \
+    -n 7 -k 90 -r 0.5 \
+    --output-dir results/
+```
+
+#### 2. Identify FOVs of interest
+
+```bash
+# List all TONIC FOVs in your data
+grep "^TONIC" ../pan_cancer_subtype/KMEANS/data/harmonized_full_with_metadata.csv | \
+    cut -d',' -f5 | sort | uniq | head -20
+```
+
+#### 3. Generate visualizations with spatial overlays
+
+```bash
+python visualize_expanded.py \
+    results/*_clusters.csv \
+    --metadata ../pan_cancer_subtype/KMEANS/data/harmonized_full_with_metadata.csv \
+    --output-dir plots/ \
+    --spatial-overlays \
+    --seg-dir /oak/stanford/groups/ccurtis2/users/syparkmd/Projects/TONIC/Data_from_Noah/deepcell_output \
+    --spatial-fovs TONIC_TMA10_R3C3 TONIC_TMA10_R3C4
+```
+
+### Interpreting Spatial Overlay Results
+
+The `<FOV>_phenotype_vs_cluster.png` files show:
+- **Left (Phenotype)**: Spatial distribution of cell types
+- **Right (Cluster)**: Spatial distribution of Leiden clusters
+
+**What to Look For:**
+
+1. **Spatial Organization**:
+   - Do clusters capture spatial regions (tumor core, periphery, stroma)?
+   - Or do clusters mix cells from different spatial locations?
+
+2. **Cell Type Composition**:
+   - Are clusters homogeneous (single cell type) or mixed?
+   - Do clusters group spatially adjacent cells of different types?
+
+3. **Biological Interpretation**:
+   - **Homogeneous spatial clusters**: Suggest clusters represent distinct tissue compartments
+   - **Mixed cell type, spatially coherent**: Suggest clusters represent microenvironments or niches
+   - **Scattered, mixed patterns**: May indicate clusters driven by composition rather than spatial organization
+
+### Troubleshooting Spatial Overlays
+
+**Error: "Spatial overlay functionality not available"**
+- Install ark-analysis v0.7.2 (see Prerequisites)
+- Ensure you're in the correct conda environment
+
+**Error: "Segmentation directory not found"**
+- Verify the path to segmentation masks is correct
+- Check file permissions
+
+**Error: "No cells found for specified FOVs"**
+- Verify FOV names match exactly (case-sensitive)
+- Check that FOVs exist in your cluster results CSV
+
 ## Memory Considerations
 
 For a dataset with 1.2M cells and 6 features:

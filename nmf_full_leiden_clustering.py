@@ -17,14 +17,16 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+import scipy.sparse
 from sklearn.decomposition import NMF, TruncatedSVD
 from sklearn.metrics import adjusted_rand_score, silhouette_score, davies_bouldin_score
 import scanpy as sc
 import anndata as ad
+import igraph as ig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -286,9 +288,21 @@ def run_leiden_clustering(
     resolution: float = 0.1,
     n_neighbors: int = 15,
     random_state: int = 42,
-) -> np.ndarray:
+    return_graph: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, scipy.sparse.csr_matrix]]:
     """
     Run Leiden clustering on factor loadings using scanpy.
+
+    Args:
+        factor_matrix: NMF factor loadings (cells x components)
+        resolution: Leiden resolution parameter
+        n_neighbors: Number of neighbors for kNN graph
+        random_state: Random seed
+        return_graph: If True, return (labels, connectivity_matrix)
+
+    Returns:
+        labels: Cluster assignments (if return_graph=False)
+        (labels, connectivity_matrix): If return_graph=True
     """
     logger.info(f"Building AnnData object with {factor_matrix.shape[0]:,} cells...")
 
@@ -319,7 +333,12 @@ def run_leiden_clustering(
     n_clusters = len(np.unique(cluster_labels))
     logger.info(f"Found {n_clusters} clusters")
 
-    return cluster_labels
+    # NEW: Optionally return connectivity matrix
+    if return_graph:
+        connectivity_matrix = adata.obsp["connectivities"]
+        return cluster_labels, connectivity_matrix
+    else:
+        return cluster_labels
 
 
 def subsample_stratified_by_fov(
@@ -372,8 +391,22 @@ def run_leiden_with_labels(
     resolution: float,
     n_neighbors: int,
     random_state: int = 42,
-) -> np.ndarray:
-    """Run Leiden clustering and return labels (quiet version for tuning)."""
+    return_graph: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, scipy.sparse.csr_matrix]]:
+    """
+    Run Leiden clustering and return labels (quiet version for tuning).
+
+    Args:
+        factor_matrix: NMF factor loadings (cells x components)
+        resolution: Leiden resolution parameter
+        n_neighbors: Number of neighbors for kNN graph
+        random_state: Random seed
+        return_graph: If True, return (labels, connectivity_matrix)
+
+    Returns:
+        labels: Cluster assignments (if return_graph=False)
+        (labels, connectivity_matrix): If return_graph=True
+    """
     adata = ad.AnnData(factor_matrix)
     adata.obsm["X_nmf"] = factor_matrix
 
@@ -393,7 +426,14 @@ def run_leiden_with_labels(
         n_iterations=2,
     )
 
-    return adata.obs["leiden"].values.astype(int)
+    cluster_labels = adata.obs["leiden"].values.astype(int)
+
+    # NEW: Optionally return connectivity matrix
+    if return_graph:
+        connectivity_matrix = adata.obsp["connectivities"]
+        return cluster_labels, connectivity_matrix
+    else:
+        return cluster_labels
 
 
 def compute_cluster_stats(
@@ -402,8 +442,26 @@ def compute_cluster_stats(
     compute_silhouette: bool = True,
     silhouette_n: int = 0,
     silhouette_seed: int = 42,
+    connectivity_matrix: scipy.sparse.csr_matrix = None,
 ) -> Dict:
-    """Compute cluster statistics and quality metrics."""
+    """
+    Compute cluster statistics and quality metrics.
+
+    Args:
+        labels: Cluster assignments
+        factor_matrix: NMF factor loadings (cells x components)
+        compute_silhouette: Whether to compute silhouette score
+        silhouette_n: Subsample size for silhouette (0 = all cells)
+        silhouette_seed: Random seed for silhouette subsampling
+        connectivity_matrix: Sparse connectivity matrix for graph-based metrics
+
+    Returns:
+        Dictionary with cluster statistics and quality metrics
+
+    Note:
+        factor_matrix is normalized row-wise before computing silhouette and DB scores
+        to convert raw factor loadings to proportions (as recommended for NMF).
+    """
     unique, counts = np.unique(labels, return_counts=True)
 
     stats = {
@@ -416,36 +474,200 @@ def compute_cluster_stats(
     # Default metrics
     stats["silhouette_score"] = None
     stats["davies_bouldin_score"] = None
-    stats["silhouette_n"] = None  # record how many points used
+    stats["silhouette_n"] = None
+    stats["modularity"] = None
+    stats["mean_conductance"] = None
+    stats["mean_cut_ratio"] = None
+    stats["n_edges"] = None
 
     if factor_matrix is None or len(unique) <= 1:
+        # Still compute graph metrics if available
+        if connectivity_matrix is not None and len(unique) > 1:
+            graph_metrics = compute_graph_metrics(labels, connectivity_matrix)
+            stats.update(graph_metrics)
         return stats
+
+    # NORMALIZE W BEFORE COMPUTING METRICS
+    # Convert raw factor loadings to proportions (row-wise normalization)
+    row_sums = factor_matrix.sum(axis=1, keepdims=True)
+    W_normalized = factor_matrix / (row_sums + 1e-12)  # Add epsilon to prevent division by zero
 
     # Davies-Bouldin is relatively cheap
     try:
-        stats["davies_bouldin_score"] = float(davies_bouldin_score(factor_matrix, labels))
+        stats["davies_bouldin_score"] = float(davies_bouldin_score(W_normalized, labels))
     except Exception:
         stats["davies_bouldin_score"] = None
 
     # Silhouette can be very expensive; optionally subsample
     if not compute_silhouette:
+        # Compute graph metrics before returning
+        if connectivity_matrix is not None:
+            graph_metrics = compute_graph_metrics(labels, connectivity_matrix)
+            stats.update(graph_metrics)
         return stats
 
     try:
-        n = factor_matrix.shape[0]
+        n = W_normalized.shape[0]
         if silhouette_n and silhouette_n < n:
             rng = np.random.default_rng(silhouette_seed)
             idx = rng.choice(n, size=silhouette_n, replace=False)
-            stats["silhouette_score"] = float(silhouette_score(factor_matrix[idx], labels[idx]))
+            stats["silhouette_score"] = float(silhouette_score(W_normalized[idx], labels[idx], metric="cosine"))
             stats["silhouette_n"] = int(silhouette_n)
         else:
-            stats["silhouette_score"] = float(silhouette_score(factor_matrix, labels))
+            stats["silhouette_score"] = float(silhouette_score(W_normalized, labels, metric="cosine"))
             stats["silhouette_n"] = int(n)
     except Exception:
         stats["silhouette_score"] = None
         stats["silhouette_n"] = None
 
+    # Compute graph-based metrics if connectivity matrix provided
+    if connectivity_matrix is not None:
+        graph_metrics = compute_graph_metrics(labels, connectivity_matrix)
+        stats.update(graph_metrics)
+
     return stats
+
+
+def compute_graph_metrics(
+    labels: np.ndarray,
+    connectivity_matrix: scipy.sparse.csr_matrix,
+) -> Dict:
+    """
+    Compute graph-based clustering quality metrics.
+
+    Since Leiden clustering is graph-based, these metrics evaluate cluster quality
+    in the context of the k-nearest neighbor graph structure rather than the
+    embedding space.
+
+    Args:
+        labels: Cluster assignments for each node
+        connectivity_matrix: Sparse adjacency/connectivity matrix from kNN graph
+
+    Returns:
+        Dictionary with:
+        - modularity: Graph modularity score (range [-0.5, 1], higher is better)
+        - mean_conductance: Mean conductance across clusters (range [0, 1], lower is better)
+        - mean_cut_ratio: Mean normalized cut ratio (range [0, 1], lower is better)
+        - n_edges: Total number of edges in graph
+
+    Metric Interpretations:
+        Modularity: Fraction of edges within communities minus expected value
+            >0.7: Strong community structure
+            0.4-0.7: Moderate communities
+            <0.4: Weak communities
+
+        Conductance: Fraction of edges leaving each cluster
+            <0.2: Well-separated clusters
+            0.2-0.5: Moderate separation
+            >0.5: Poor separation
+
+        Cut Ratio: Edges crossing cluster boundary / max possible cuts
+            <0.01: Very sparse cuts
+            0.01-0.1: Moderate cuts
+            >0.1: Dense cuts
+    """
+    try:
+        # Convert sparse matrix to edge list for igraph
+        if not scipy.sparse.issparse(connectivity_matrix):
+            connectivity_matrix = scipy.sparse.csr_matrix(connectivity_matrix)
+
+        # Get edges from sparse matrix (upper triangle only for undirected graph)
+        coo = connectivity_matrix.tocoo()
+        edge_list = []
+        weights = []
+
+        for i in range(len(coo.row)):
+            if coo.row[i] < coo.col[i]:  # Upper triangle only
+                edge_list.append((coo.row[i], coo.col[i]))
+                weights.append(coo.data[i])
+
+        n_nodes = connectivity_matrix.shape[0]
+
+        # Build igraph Graph
+        graph = ig.Graph(n=n_nodes, edges=edge_list, directed=False)
+        if weights:
+            graph.es['weight'] = weights
+
+        # 1. MODULARITY
+        membership = labels.astype(int).tolist()
+        modularity = graph.modularity(membership, weights='weight' if weights else None)
+
+        # 2. CONDUCTANCE (per cluster, then average)
+        conductances = []
+        unique_labels = np.unique(labels)
+
+        for cluster_id in unique_labels:
+            cluster_mask = labels == cluster_id
+            cluster_indices = np.where(cluster_mask)[0]
+
+            if len(cluster_indices) == 0:
+                continue
+
+            internal_weight = 0.0
+            boundary_weight = 0.0
+
+            # Iterate through cluster nodes
+            for node in cluster_indices:
+                neighbors = connectivity_matrix[node].nonzero()[1]
+                for neighbor in neighbors:
+                    weight = connectivity_matrix[node, neighbor]
+                    if labels[neighbor] == cluster_id:
+                        internal_weight += weight
+                    else:
+                        boundary_weight += weight
+
+            # Conductance = boundary / (internal + boundary)
+            total_weight = internal_weight + boundary_weight
+            if total_weight > 0:
+                conductance = boundary_weight / total_weight
+                conductances.append(conductance)
+
+        mean_conductance = float(np.mean(conductances)) if conductances else None
+
+        # 3. CUT RATIO (per cluster, then average)
+        cut_ratios = []
+
+        for cluster_id in unique_labels:
+            cluster_mask = labels == cluster_id
+            cluster_size = cluster_mask.sum()
+            outside_size = len(labels) - cluster_size
+
+            if cluster_size == 0 or outside_size == 0:
+                continue
+
+            # Count edges between cluster and outside
+            cut_weight = 0.0
+            cluster_indices = np.where(cluster_mask)[0]
+
+            for node in cluster_indices:
+                neighbors = connectivity_matrix[node].nonzero()[1]
+                for neighbor in neighbors:
+                    if not cluster_mask[neighbor]:
+                        cut_weight += connectivity_matrix[node, neighbor]
+
+            # Normalized cut ratio
+            max_possible_cuts = cluster_size * outside_size
+            if max_possible_cuts > 0:
+                cut_ratio = cut_weight / max_possible_cuts
+                cut_ratios.append(cut_ratio)
+
+        mean_cut_ratio = float(np.mean(cut_ratios)) if cut_ratios else None
+
+        return {
+            "modularity": float(modularity),
+            "mean_conductance": mean_conductance,
+            "mean_cut_ratio": mean_cut_ratio,
+            "n_edges": len(edge_list),
+        }
+
+    except Exception as e:
+        logger.warning(f"Failed to compute graph metrics: {e}")
+        return {
+            "modularity": None,
+            "mean_conductance": None,
+            "mean_cut_ratio": None,
+            "n_edges": None,
+        }
 
 
 def compute_stability_ari(
@@ -453,13 +675,53 @@ def compute_stability_ari(
     resolution: float,
     n_neighbors: int,
     seeds: List[int],
+    neighbor_seed: int = 42,
 ) -> Tuple[float, float]:
-    """Compute clustering stability via ARI across different random seeds."""
+    """
+    Compute clustering stability via ARI across different Leiden random seeds.
+
+    Builds the neighbor graph ONCE with a fixed seed, then runs Leiden clustering
+    multiple times with different seeds to test only the stochasticity of the
+    Leiden algorithm itself (not the neighbor graph construction).
+
+    Args:
+        factor_matrix: NMF factor loadings (cells x components)
+        resolution: Leiden resolution parameter
+        n_neighbors: Number of neighbors for kNN graph
+        seeds: List of random seeds to test Leiden stability
+        neighbor_seed: Fixed seed for neighbor graph construction (default: 42)
+
+    Returns:
+        mean_ari: Mean ARI across all pairwise comparisons
+        std_ari: Standard deviation of ARI scores
+    """
+    # Build neighbor graph ONCE with fixed seed
+    adata = ad.AnnData(factor_matrix)
+    adata.obsm["X_nmf"] = factor_matrix
+
+    sc.pp.neighbors(
+        adata,
+        n_neighbors=n_neighbors,
+        use_rep="X_nmf",
+        method="umap",
+        random_state=neighbor_seed,  # Fixed seed for reproducible neighbor graph
+    )
+
+    # Run Leiden multiple times with different seeds on the SAME graph
     all_labels = []
     for seed in seeds:
-        labels = run_leiden_with_labels(factor_matrix, resolution, n_neighbors, seed)
+        sc.tl.leiden(
+            adata,
+            resolution=resolution,
+            random_state=seed,  # Only Leiden algorithm varies
+            flavor="igraph",
+            n_iterations=2,
+            key_added=f"leiden_{seed}",  # Store each result separately
+        )
+        labels = adata.obs[f"leiden_{seed}"].values.astype(int)
         all_labels.append(labels)
 
+    # Compute pairwise ARI scores
     ari_scores = []
     for i in range(len(seeds)):
         for j in range(i + 1, len(seeds)):
@@ -487,11 +749,11 @@ def run_tuning(
     Run hyperparameter tuning on a subsample of the data.
     """
     if n_components_list is None:
-        n_components_list = [2, 3, 4, 5, 6, 7, 8]
+        n_components_list = [5, 6, 7, 8, 9]
     if n_neighbors_list is None:
         n_neighbors_list = [50, 70, 90, 110, 130]
     if resolution_list is None:
-        resolution_list = [0.01, 0.1, 0.3, 0.5, 0.8, 1.0]
+        resolution_list = [0.01, 0.05, 0.1, 0.2, 0.3]
     if stability_seeds is None:
         stability_seeds = [42, 123, 456, 789, 1011]
 
@@ -547,11 +809,15 @@ def run_tuning(
                 combo_idx += 1
                 logger.info(f"  [{combo_idx}/{total_combos}] n={n}, k={k}, r={r}")
 
-                labels = run_leiden_with_labels(W, r, k, random_state)
-                stats = compute_cluster_stats(labels, W,
-                                              compute_silhouette=compute_silhouette,
-                                                silhouette_n=silhouette_n,
-                                                silhouette_seed=silhouette_seed,)
+                labels, connectivity_matrix = run_leiden_with_labels(W, r, k, random_state, return_graph=True)
+                stats = compute_cluster_stats(
+                    labels,
+                    W,
+                    compute_silhouette=compute_silhouette,
+                    silhouette_n=silhouette_n,
+                    silhouette_seed=silhouette_seed,
+                    connectivity_matrix=connectivity_matrix,
+                )
 
                 result = {
                     "n_components": n,
@@ -564,6 +830,10 @@ def run_tuning(
                     "silhouette_score": stats["silhouette_score"],
                     "silhouette_n": stats["silhouette_n"],
                     "davies_bouldin_score": stats["davies_bouldin_score"],
+                    "modularity": stats["modularity"],
+                    "mean_conductance": stats["mean_conductance"],
+                    "mean_cut_ratio": stats["mean_cut_ratio"],
+                    "n_edges": stats["n_edges"],
                 }
                 grid_results.append(result)
 
@@ -577,6 +847,8 @@ def run_tuning(
     grid_df = pd.DataFrame(grid_results)
 
     logger.info("\n[Step 4] Stability analysis (ARI across seeds)...")
+    logger.info("  Testing Leiden algorithm stability with different random seeds")
+    logger.info("  (neighbor graph is built once with fixed seed, only Leiden varies)")
     stability_results = []
 
     mid_n = n_components_list[len(n_components_list) // 2]
@@ -585,7 +857,9 @@ def run_tuning(
 
     for r in resolution_list:
         logger.info(f"  resolution={r} (n={mid_n}, k={mid_k})...")
-        mean_ari, std_ari = compute_stability_ari(W_mid, r, mid_k, stability_seeds)
+        mean_ari, std_ari = compute_stability_ari(
+            W_mid, r, mid_k, stability_seeds, neighbor_seed=random_state
+        )
         stability_results.append(
             {
                 "resolution": r,
@@ -668,6 +942,7 @@ def generate_tuning_report(
             "\n" + "-" * 50,
             "2. LEIDEN: STABILITY (ARI across seeds)",
             "-" * 50,
+            "  Note: Neighbor graph built once, only Leiden algorithm randomness tested",
         ]
     )
 
@@ -702,6 +977,31 @@ def generate_tuning_report(
                     f"    n={int(row['n_components'])}, k={int(row['n_neighbors'])}, "
                     f"r={row['resolution']:.2f} -> sil={row['silhouette_score']:.4f}, "
                     f"DB={row['davies_bouldin_score']:.4f}, clusters={int(row['n_clusters'])}"
+                )
+
+    lines.extend(
+        [
+            "\n" + "-" * 50,
+            "3.5. GRAPH-BASED METRICS",
+            "-" * 50,
+            "  Modularity: Higher is better (>0.7 = strong communities)",
+            "  Conductance: Lower is better (<0.2 = well-separated)",
+            "  Cut Ratio: Lower is better (<0.01 = sparse cuts)",
+        ]
+    )
+
+    has_modularity = "modularity" in grid_df.columns
+    if has_modularity:
+        valid_mod = grid_df[grid_df["modularity"].notna()].copy()
+        if len(valid_mod) > 0:
+            top_5_mod = valid_mod.nlargest(5, "modularity")
+            lines.append("\n  Top 5 configurations by Modularity:")
+            for _, row in top_5_mod.iterrows():
+                lines.append(
+                    f"    n={int(row['n_components'])}, k={int(row['n_neighbors'])}, "
+                    f"r={row['resolution']:.2f} -> mod={row['modularity']:.4f}, "
+                    f"cond={row['mean_conductance']:.4f}, cut={row['mean_cut_ratio']:.6f}, "
+                    f"clusters={int(row['n_clusters'])}"
                 )
 
     lines.extend(
@@ -750,6 +1050,10 @@ def generate_tuning_report(
             lines.append(f"    Min cluster size: {int(best['min_cluster_size'])}")
             lines.append(f"    Silhouette score: {best['silhouette_score']:.4f}")
             lines.append(f"    Davies-Bouldin:   {best['davies_bouldin_score']:.4f}")
+            if "modularity" in best.index and best['modularity'] is not None:
+                lines.append(f"    Modularity:       {best['modularity']:.4f}")
+                lines.append(f"    Mean Conductance: {best['mean_conductance']:.4f}")
+                lines.append(f"    Mean Cut Ratio:   {best['mean_cut_ratio']:.6f}")
 
             lines.append("")
             lines.append("  Run with:")
