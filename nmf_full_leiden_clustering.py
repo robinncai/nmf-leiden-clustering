@@ -13,9 +13,11 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -289,6 +291,7 @@ def run_leiden_clustering(
     n_neighbors: int = 15,
     random_state: int = 42,
     return_graph: bool = False,
+    use_cosine: bool = True,
 ) -> Union[np.ndarray, Tuple[np.ndarray, scipy.sparse.csr_matrix]]:
     """
     Run Leiden clustering on factor loadings using scanpy.
@@ -299,6 +302,8 @@ def run_leiden_clustering(
         n_neighbors: Number of neighbors for kNN graph
         random_state: Random seed
         return_graph: If True, return (labels, connectivity_matrix)
+        use_cosine: If True, row-normalize W and use cosine distance for kNN graph.
+                    This matches the geometry used for silhouette/DB scoring.
 
     Returns:
         labels: Cluster assignments (if return_graph=False)
@@ -306,8 +311,17 @@ def run_leiden_clustering(
     """
     logger.info(f"Building AnnData object with {factor_matrix.shape[0]:,} cells...")
 
-    adata = ad.AnnData(factor_matrix)
-    adata.obsm["X_nmf"] = factor_matrix
+    # Row-normalize if using cosine distance to match scoring geometry
+    if use_cosine:
+        row_sums = factor_matrix.sum(axis=1, keepdims=True)
+        W_normalized = factor_matrix / (row_sums + 1e-12)
+        logger.info("Using row-normalized W with cosine distance for kNN graph")
+    else:
+        W_normalized = factor_matrix
+        logger.info("Using raw W with Euclidean distance for kNN graph")
+
+    adata = ad.AnnData(W_normalized)
+    adata.obsm["X_nmf"] = W_normalized
 
     logger.info(f"Computing {n_neighbors} nearest neighbors...")
 
@@ -316,6 +330,7 @@ def run_leiden_clustering(
         n_neighbors=n_neighbors,
         use_rep="X_nmf",
         method="umap",  # approximate neighbors via pynndescent
+        metric="cosine" if use_cosine else "euclidean",
         random_state=random_state,
     )
 
@@ -392,6 +407,7 @@ def run_leiden_with_labels(
     n_neighbors: int,
     random_state: int = 42,
     return_graph: bool = False,
+    use_cosine: bool = True,
 ) -> Union[np.ndarray, Tuple[np.ndarray, scipy.sparse.csr_matrix]]:
     """
     Run Leiden clustering and return labels (quiet version for tuning).
@@ -402,19 +418,28 @@ def run_leiden_with_labels(
         n_neighbors: Number of neighbors for kNN graph
         random_state: Random seed
         return_graph: If True, return (labels, connectivity_matrix)
+        use_cosine: If True, row-normalize W and use cosine distance for kNN graph.
 
     Returns:
         labels: Cluster assignments (if return_graph=False)
         (labels, connectivity_matrix): If return_graph=True
     """
-    adata = ad.AnnData(factor_matrix)
-    adata.obsm["X_nmf"] = factor_matrix
+    # Row-normalize if using cosine distance to match scoring geometry
+    if use_cosine:
+        row_sums = factor_matrix.sum(axis=1, keepdims=True)
+        W_normalized = factor_matrix / (row_sums + 1e-12)
+    else:
+        W_normalized = factor_matrix
+
+    adata = ad.AnnData(W_normalized)
+    adata.obsm["X_nmf"] = W_normalized
 
     sc.pp.neighbors(
         adata,
         n_neighbors=n_neighbors,
         use_rep="X_nmf",
         method="umap",
+        metric="cosine" if use_cosine else "euclidean",
         random_state=random_state,
     )
 
@@ -676,6 +701,7 @@ def compute_stability_ari(
     n_neighbors: int,
     seeds: List[int],
     neighbor_seed: int = 42,
+    use_cosine: bool = True,
 ) -> Tuple[float, float]:
     """
     Compute clustering stability via ARI across different Leiden random seeds.
@@ -690,20 +716,29 @@ def compute_stability_ari(
         n_neighbors: Number of neighbors for kNN graph
         seeds: List of random seeds to test Leiden stability
         neighbor_seed: Fixed seed for neighbor graph construction (default: 42)
+        use_cosine: If True, row-normalize W and use cosine distance for kNN graph.
 
     Returns:
         mean_ari: Mean ARI across all pairwise comparisons
         std_ari: Standard deviation of ARI scores
     """
+    # Row-normalize if using cosine distance to match scoring geometry
+    if use_cosine:
+        row_sums = factor_matrix.sum(axis=1, keepdims=True)
+        W_normalized = factor_matrix / (row_sums + 1e-12)
+    else:
+        W_normalized = factor_matrix
+
     # Build neighbor graph ONCE with fixed seed
-    adata = ad.AnnData(factor_matrix)
-    adata.obsm["X_nmf"] = factor_matrix
+    adata = ad.AnnData(W_normalized)
+    adata.obsm["X_nmf"] = W_normalized
 
     sc.pp.neighbors(
         adata,
         n_neighbors=n_neighbors,
         use_rep="X_nmf",
         method="umap",
+        metric="cosine" if use_cosine else "euclidean",
         random_state=neighbor_seed,  # Fixed seed for reproducible neighbor graph
     )
 
@@ -744,16 +779,20 @@ def run_tuning(
     compute_silhouette: bool = True,
     silhouette_n: int = 20000,
     silhouette_seed: int = 42,
+    normalize_by_fov_flag: bool = True,
+    use_cosine: bool = True,
+    args: Optional[argparse.Namespace] = None,
+    ground_truth_col: str = "cell_meta_cluster",
 ) -> pd.DataFrame:
     """
     Run hyperparameter tuning on a subsample of the data.
     """
     if n_components_list is None:
-        n_components_list = [5, 6, 7, 8, 9]
+        n_components_list = [5, 6, 7, 8]
     if n_neighbors_list is None:
-        n_neighbors_list = [50, 70, 90, 110, 130]
+        n_neighbors_list = [70, 90, 110]
     if resolution_list is None:
-        resolution_list = [0.01, 0.05, 0.1, 0.2, 0.3]
+        resolution_list = [0.02, 0.04, 0.06, 0.1, 0.2]
     if stability_seeds is None:
         stability_seeds = [42, 123, 456, 789, 1011]
 
@@ -768,11 +807,20 @@ def run_tuning(
 
     os.makedirs(output_dir, exist_ok=True)
 
+    # Save CLI arguments for reproducibility
+    if args is not None:
+        basename = Path(input_file).stem
+        save_cli_args(output_dir, basename, args, mode="tuning")
+
     logger.info(f"\n[Step 1] Loading and subsampling to {n_subsample:,} cells...")
     metadata_df, data_matrix, feature_names = load_data_chunked(input_file, chunksize)
     metadata_df, data_matrix = subsample_stratified_by_fov(
         metadata_df, data_matrix, n_subsample, random_state
     )
+
+    # after subsample_stratified_by_fov(...)
+    if normalize_by_fov_flag:
+        data_matrix = normalize_by_fov(metadata_df, data_matrix)
 
     logger.info("\n[Step 2] Evaluating n_components (reconstruction error + explained variance)...")
     nmf_results = []
@@ -798,6 +846,7 @@ def run_tuning(
     nmf_df = pd.DataFrame(nmf_results)
 
     logger.info("\n[Step 3] Grid search over n_components/n_neighbors/resolution...")
+    logger.info("  (Computing stability ARI for each parameter combination)")
     grid_results = []
     total_combos = len(n_components_list) * len(n_neighbors_list) * len(resolution_list)
     combo_idx = 0
@@ -809,7 +858,7 @@ def run_tuning(
                 combo_idx += 1
                 logger.info(f"  [{combo_idx}/{total_combos}] n={n}, k={k}, r={r}")
 
-                labels, connectivity_matrix = run_leiden_with_labels(W, r, k, random_state, return_graph=True)
+                labels, connectivity_matrix = run_leiden_with_labels(W, r, k, random_state, return_graph=True, use_cosine=use_cosine)
                 stats = compute_cluster_stats(
                     labels,
                     W,
@@ -817,6 +866,11 @@ def run_tuning(
                     silhouette_n=silhouette_n,
                     silhouette_seed=silhouette_seed,
                     connectivity_matrix=connectivity_matrix,
+                )
+
+                # Compute stability ARI for this parameter combination
+                mean_ari, std_ari = compute_stability_ari(
+                    W, r, k, stability_seeds, neighbor_seed=random_state, use_cosine=use_cosine
                 )
 
                 result = {
@@ -834,15 +888,36 @@ def run_tuning(
                     "mean_conductance": stats["mean_conductance"],
                     "mean_cut_ratio": stats["mean_cut_ratio"],
                     "n_edges": stats["n_edges"],
+                    "mean_ari": mean_ari,
+                    "std_ari": std_ari,
                 }
                 grid_results.append(result)
 
                 sil = stats["silhouette_score"]
                 db = stats["davies_bouldin_score"]
-                if sil is not None:
-                    logger.info(
-                        f"    clusters={stats['n_clusters']}, silhouette={sil:.4f}, DB={db:.4f}"
-                    )
+                mod = stats["modularity"]
+                cond = stats["mean_conductance"]
+                cut = stats["mean_cut_ratio"]
+                n_edges = stats["n_edges"]
+
+                logger.info(
+                    "    clusters=%s, min/med/max=%s/%s/%s, ARI=%.4f±%.4f, "
+                    "sil=%s (n=%s), DB=%s, "
+                    "mod=%s, cond=%s, cut=%s, edges=%s",
+                    stats["n_clusters"],
+                    stats["min_cluster_size"],
+                    stats["median_cluster_size"],
+                    stats["max_cluster_size"],
+                    mean_ari,
+                    std_ari,
+                    f"{sil:.4f}" if sil is not None else "NA",
+                    stats["silhouette_n"] if stats["silhouette_n"] is not None else "NA",
+                    f"{db:.4f}" if db is not None else "NA",
+                    f"{mod:.4f}" if mod is not None else "NA",
+                    f"{cond:.4f}" if cond is not None else "NA",
+                    f"{cut:.6f}" if cut is not None else "NA",
+                    n_edges if n_edges is not None else "NA",
+                )
 
     grid_df = pd.DataFrame(grid_results)
 
@@ -858,7 +933,7 @@ def run_tuning(
     for r in resolution_list:
         logger.info(f"  resolution={r} (n={mid_n}, k={mid_k})...")
         mean_ari, std_ari = compute_stability_ari(
-            W_mid, r, mid_k, stability_seeds, neighbor_seed=random_state
+            W_mid, r, mid_k, stability_seeds, neighbor_seed=random_state, use_cosine=use_cosine
         )
         stability_results.append(
             {
@@ -973,16 +1048,39 @@ def generate_tuning_report(
             top_5 = valid_sil.nlargest(5, "silhouette_score")
             lines.append("\n  Top 5 configurations by Silhouette Score:")
             for _, row in top_5.iterrows():
+                ari_str = f", ARI={row['mean_ari']:.4f}±{row['std_ari']:.4f}" if "mean_ari" in row else ""
                 lines.append(
                     f"    n={int(row['n_components'])}, k={int(row['n_neighbors'])}, "
                     f"r={row['resolution']:.2f} -> sil={row['silhouette_score']:.4f}, "
-                    f"DB={row['davies_bouldin_score']:.4f}, clusters={int(row['n_clusters'])}"
+                    f"DB={row['davies_bouldin_score']:.4f}{ari_str}, clusters={int(row['n_clusters'])}"
+                )
+
+    # Add section for stability ARI
+    has_ari = "mean_ari" in grid_df.columns
+    if has_ari:
+        lines.extend(
+            [
+                "\n" + "-" * 50,
+                "3.5. STABILITY (ARI across seeds per configuration)",
+                "-" * 50,
+                "  (Higher ARI = more stable clustering; ≥0.9 is excellent)",
+            ]
+        )
+        valid_ari = grid_df[grid_df["mean_ari"].notna()].copy()
+        if len(valid_ari) > 0:
+            top_5_ari = valid_ari.nlargest(5, "mean_ari")
+            lines.append("\n  Top 5 configurations by Stability (ARI):")
+            for _, row in top_5_ari.iterrows():
+                lines.append(
+                    f"    n={int(row['n_components'])}, k={int(row['n_neighbors'])}, "
+                    f"r={row['resolution']:.2f} -> ARI={row['mean_ari']:.4f}±{row['std_ari']:.4f}, "
+                    f"clusters={int(row['n_clusters'])}"
                 )
 
     lines.extend(
         [
             "\n" + "-" * 50,
-            "3.5. GRAPH-BASED METRICS",
+            "3.6. GRAPH-BASED METRICS",
             "-" * 50,
             "  Modularity: Higher is better (>0.7 = strong communities)",
             "  Conductance: Lower is better (<0.2 = well-separated)",
@@ -1029,11 +1127,18 @@ def generate_tuning_report(
     good_configs = grid_df[grid_df["min_cluster_size"] >= 50].copy()
 
     if len(good_configs) > 0 and has_silhouette:
-        stable_resolutions = stability_df[stability_df["mean_ari"] >= 0.9]["resolution"].tolist()
-        if stable_resolutions:
-            stable_configs = good_configs[good_configs["resolution"].isin(stable_resolutions)]
+        # Filter by stability ARI from grid search results if available
+        if has_ari:
+            stable_configs = good_configs[good_configs["mean_ari"] >= 0.9]
             if len(stable_configs) > 0:
                 good_configs = stable_configs
+        else:
+            # Fallback to stability_df for backward compatibility
+            stable_resolutions = stability_df[stability_df["mean_ari"] >= 0.9]["resolution"].tolist()
+            if stable_resolutions:
+                stable_configs = good_configs[good_configs["resolution"].isin(stable_resolutions)]
+                if len(stable_configs) > 0:
+                    good_configs = stable_configs
 
         good_configs = good_configs[good_configs["silhouette_score"].notna()]
 
@@ -1050,6 +1155,8 @@ def generate_tuning_report(
             lines.append(f"    Min cluster size: {int(best['min_cluster_size'])}")
             lines.append(f"    Silhouette score: {best['silhouette_score']:.4f}")
             lines.append(f"    Davies-Bouldin:   {best['davies_bouldin_score']:.4f}")
+            if "mean_ari" in best.index and best['mean_ari'] is not None:
+                lines.append(f"    Stability (ARI):  {best['mean_ari']:.4f} ± {best['std_ari']:.4f}")
             if "modularity" in best.index and best['modularity'] is not None:
                 lines.append(f"    Modularity:       {best['modularity']:.4f}")
                 lines.append(f"    Mean Conductance: {best['mean_conductance']:.4f}")
@@ -1077,6 +1184,101 @@ def generate_tuning_report(
 
     lines.append("\n" + "=" * 70)
     return "\n".join(lines)
+
+
+def save_cli_args(
+    output_dir: str,
+    basename: str,
+    args: argparse.Namespace,
+    mode: str = "pipeline",
+) -> None:
+    """
+    Save CLI arguments to JSON and TXT files for reproducibility.
+
+    Args:
+        output_dir: Output directory
+        basename: Base name for output files
+        args: Parsed command-line arguments
+        mode: Either "pipeline" or "tuning" to indicate which mode was run
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Convert args namespace to dictionary
+    args_dict = vars(args).copy()
+
+    # Add metadata
+    args_dict["_metadata"] = {
+        "timestamp": datetime.now().isoformat(),
+        "mode": mode,
+        "script": "nmf_full_leiden_clustering.py",
+    }
+
+    # Save as JSON
+    json_path = os.path.join(output_dir, f"{basename}_cli_args.json")
+    with open(json_path, "w") as f:
+        json.dump(args_dict, f, indent=2, default=str)
+    logger.info(f"Saved CLI arguments to {json_path}")
+
+    # Save as human-readable TXT
+    txt_path = os.path.join(output_dir, f"{basename}_cli_args.txt")
+    with open(txt_path, "w") as f:
+        f.write("=" * 60 + "\n")
+        f.write("NMF + Leiden Clustering - CLI Arguments\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Timestamp: {args_dict['_metadata']['timestamp']}\n")
+        f.write(f"Mode: {mode}\n")
+        f.write("-" * 60 + "\n\n")
+
+        f.write("INPUT/OUTPUT:\n")
+        f.write(f"  input_file:        {args.input_file}\n")
+        f.write(f"  output_dir:        {args.output_dir}\n")
+        f.write("\n")
+
+        if mode == "pipeline":
+            f.write("NMF PARAMETERS:\n")
+            f.write(f"  n_components:      {args.n_components}\n")
+            f.write(f"  batch_size:        {args.batch_size} (ignored for full NMF)\n")
+            f.write("\n")
+
+            f.write("LEIDEN PARAMETERS:\n")
+            f.write(f"  resolution:        {args.resolution}\n")
+            f.write(f"  n_neighbors:       {args.n_neighbors}\n")
+            f.write(f"  kNN metric:        {'euclidean (raw W)' if args.euclidean else 'cosine (row-normalized W)'}\n")
+            f.write("\n")
+
+            f.write("PREPROCESSING:\n")
+            f.write(f"  normalize_by_fov:  {args.normalize_by_fov}\n")
+            f.write(f"  svd:               {args.svd}\n")
+            f.write("\n")
+
+            f.write("SUBSAMPLING:\n")
+            f.write(f"  subsample:         {args.subsample}\n")
+            f.write(f"  subsample_fraction:{args.subsample_fraction}\n")
+            f.write("\n")
+
+        elif mode == "tuning":
+            f.write("TUNING PARAMETERS:\n")
+            f.write(f"  tune_subsample:    {args.tune_subsample}\n")
+            f.write(f"  tune_n:            {args.tune_n}\n")
+            f.write(f"  tune_k:            {args.tune_k}\n")
+            f.write(f"  tune_r:            {args.tune_r}\n")
+            f.write(f"  no_silhouette:     {args.no_silhouette}\n")
+            f.write(f"  silhouette_n:      {args.silhouette_n}\n")
+            f.write(f"  normalize_by_fov:  {args.normalize_by_fov}\n")
+            f.write(f"  kNN metric:        {'euclidean (raw W)' if args.euclidean else 'cosine (row-normalized W)'}\n")
+            f.write("\n")
+
+        f.write("OTHER:\n")
+        f.write(f"  chunksize:         {args.chunksize}\n")
+        f.write(f"  seed:              {args.seed}\n")
+        f.write("\n")
+
+        f.write("-" * 60 + "\n")
+        f.write("COMMAND LINE:\n")
+        f.write(f"  python nmf_full_leiden_clustering.py {' '.join(sys.argv[1:])}\n")
+        f.write("=" * 60 + "\n")
+
+    logger.info(f"Saved CLI arguments to {txt_path}")
 
 
 def save_results(
@@ -1130,6 +1332,8 @@ def run_pipeline(
     subsample_metadata_path: Optional[str] = None,
     subsample_fraction: float = 0.1,
     run_svd: bool = False,
+    use_cosine: bool = True,
+    args: Optional[argparse.Namespace] = None,
 ) -> pd.DataFrame:
     """
     Run the complete NMF + Leiden clustering pipeline.
@@ -1137,6 +1341,11 @@ def run_pipeline(
     logger.info("=" * 60)
     logger.info("NMF + Leiden Clustering Pipeline")
     logger.info("=" * 60)
+
+    # Save CLI arguments for reproducibility
+    if args is not None:
+        basename = Path(input_file).stem
+        save_cli_args(output_dir, basename, args, mode="pipeline")
 
     # Step 1: Load data (with optional batch subsampling)
     logger.info("\n[Step 1/6] Loading data...")
@@ -1205,6 +1414,7 @@ def run_pipeline(
         resolution=resolution,
         n_neighbors=n_neighbors,
         random_state=random_state,
+        use_cosine=use_cosine,
     )
 
     logger.info("\n[Step 6/6] Saving results...")
@@ -1298,6 +1508,7 @@ def main():
     parser.add_argument(
         "--normalize-by-fov",
         action="store_true",
+        default=False,
         help="Normalize cell composition by FOV-level mean to reduce sample-level bias",
     )
 
@@ -1356,6 +1567,13 @@ def main():
         help="Compute silhouette on a random subset of N cells (0 = all cells).",
     )
 
+    parser.add_argument(
+        "--euclidean",
+        action="store_true",
+        help="Use Euclidean distance on raw W for kNN graph instead of cosine distance on row-normalized W. "
+             "Default uses cosine to match the geometry of silhouette/DB scoring.",
+    )
+
     args = parser.parse_args()
 
     if not os.path.exists(args.input_file):
@@ -1370,6 +1588,8 @@ def main():
         logger.error("--subsample-fraction must be between 0 and 1")
         sys.exit(1)
 
+    use_cosine = not args.euclidean
+
     if args.tune:
         run_tuning(
             input_file=args.input_file,
@@ -1383,6 +1603,9 @@ def main():
             compute_silhouette=(not args.no_silhouette),
             silhouette_n=args.silhouette_n,
             silhouette_seed=args.seed,
+            normalize_by_fov_flag=args.normalize_by_fov,
+            use_cosine=use_cosine,
+            args=args,
         )
     else:
         run_pipeline(
@@ -1398,6 +1621,8 @@ def main():
             subsample_metadata_path=args.subsample,
             subsample_fraction=args.subsample_fraction,
             run_svd=args.svd,
+            use_cosine=use_cosine,
+            args=args,
         )
 
 
