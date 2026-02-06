@@ -1409,13 +1409,41 @@ def run_pipeline(
     del data_matrix
 
     logger.info("\n[Step 5/6] Running Leiden clustering...")
-    cluster_labels = run_leiden_clustering(
+    cluster_labels, connectivity_matrix = run_leiden_clustering(
         W,
         resolution=resolution,
         n_neighbors=n_neighbors,
         random_state=random_state,
         use_cosine=use_cosine,
+        return_graph=True,
     )
+
+    # Compute and report clustering quality metrics (excluding ARI which requires stability testing)
+    logger.info("\n[Step 5.5/6] Computing clustering quality metrics...")
+    stats = compute_cluster_stats(
+        cluster_labels,
+        W,
+        compute_silhouette=True,
+        silhouette_n=20000,
+        silhouette_seed=random_state,
+        connectivity_matrix=connectivity_matrix,
+    )
+
+    logger.info("Clustering Quality Metrics:")
+    logger.info(f"  Number of clusters:    {stats['n_clusters']}")
+    logger.info(f"  Cluster sizes:         min={stats['min_cluster_size']}, median={stats['median_cluster_size']}, max={stats['max_cluster_size']}")
+    if stats['silhouette_score'] is not None:
+        logger.info(f"  Silhouette score:      {stats['silhouette_score']:.4f} (n={stats['silhouette_n']})")
+    if stats['davies_bouldin_score'] is not None:
+        logger.info(f"  Davies-Bouldin score:  {stats['davies_bouldin_score']:.4f}")
+    if stats['modularity'] is not None:
+        logger.info(f"  Modularity:            {stats['modularity']:.4f}")
+    if stats['mean_conductance'] is not None:
+        logger.info(f"  Mean conductance:      {stats['mean_conductance']:.4f}")
+    if stats['mean_cut_ratio'] is not None:
+        logger.info(f"  Mean cut ratio:        {stats['mean_cut_ratio']:.6f}")
+    if stats['n_edges'] is not None:
+        logger.info(f"  Graph edges:           {stats['n_edges']}")
 
     logger.info("\n[Step 6/6] Saving results...")
     basename = Path(input_file).stem
@@ -1428,6 +1456,12 @@ def run_pipeline(
         basis_matrix=H,
         feature_names=feature_names,
     )
+
+    # Save clustering metrics to JSON
+    metrics_path = os.path.join(output_dir, f"{basename}_clustering_metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    logger.info(f"Saved clustering metrics to {metrics_path}")
 
     logger.info("\n" + "=" * 60)
     logger.info("Pipeline complete!")

@@ -11,6 +11,7 @@ NEW:
 - Optional PCA->UMAP on normalized feature columns in the same CSV
   (select features by prefix or explicit column list)
 - Optional spatial overlay visualizations (cell type vs cluster assignments)
+- Spatial scatter plots from neighborhood analysis CSV (centroid-based visualization)
 
 Dependencies:
 - ark-analysis v0.7.2 (for spatial overlays)
@@ -625,6 +626,349 @@ def generate_spatial_overlays(
     logger.info(f"Spatial overlays complete! Results saved to {overlay_dir}")
 
 
+# ============================================================================
+# SPATIAL SCATTER VISUALIZATION (Centroid-based)
+# ============================================================================
+
+def get_category_colors_dict(categories) -> dict:
+    """Generate distinct colors for categories as a dictionary."""
+    unique_cats = sorted(set(categories))
+    n_cats = len(unique_cats)
+
+    if n_cats <= 10:
+        cmap = plt.cm.tab10
+    elif n_cats <= 20:
+        cmap = plt.cm.tab20
+    else:
+        cmap = plt.cm.gist_ncar
+
+    return {cat: mcolors.rgb2hex(cmap(i / max(n_cats, 1))) for i, cat in enumerate(unique_cats)}
+
+
+def subsample_fovs_per_neighborhood(
+    df: pd.DataFrame,
+    n_fovs_per_nh: int = 3,
+    random_state: int = 42
+) -> pd.DataFrame:
+    """
+    Subsample FOVs: select n_fovs_per_nh FOVs per kmeans_neighborhood within each batch.
+
+    Args:
+        df: DataFrame with fov, batch, kmeans_neighborhood columns
+        n_fovs_per_nh: Number of FOVs to sample per neighborhood per batch
+        random_state: Random seed
+
+    Returns:
+        Subsampled DataFrame
+    """
+    rng = np.random.default_rng(random_state)
+
+    selected_fovs = set()
+
+    for batch in df['batch'].unique():
+        batch_df = df[df['batch'] == batch]
+
+        for nh in batch_df['kmeans_neighborhood'].unique():
+            nh_df = batch_df[batch_df['kmeans_neighborhood'] == nh]
+            unique_fovs = nh_df['fov'].unique()
+
+            n_to_sample = min(n_fovs_per_nh, len(unique_fovs))
+            sampled = rng.choice(unique_fovs, size=n_to_sample, replace=False)
+            selected_fovs.update(sampled)
+
+    subsampled = df[df['fov'].isin(selected_fovs)].copy()
+    logger.info(f"Subsampled {len(selected_fovs)} FOVs from {df['fov'].nunique()} total FOVs")
+
+    return subsampled
+
+
+def plot_spatial_fov(
+    fov_df: pd.DataFrame,
+    color_by: str,
+    color_map: dict,
+    output_path: str,
+    fov_name: str,
+    figsize: Tuple[int, int] = (10, 10),
+    size_scale: float = 0.05,
+    alpha: float = 0.7
+) -> None:
+    """
+    Plot spatial scatter for a single FOV.
+
+    Args:
+        fov_df: DataFrame for single FOV
+        color_by: Column name to color by
+        color_map: Dict mapping categories to colors
+        output_path: Path to save figure
+        fov_name: FOV identifier for title
+        figsize: Figure size
+        size_scale: Scale factor for cell sizes
+        alpha: Point transparency
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Get coordinates and sizes
+    x = fov_df['centroid-0'].values
+    y = fov_df['centroid-1'].values
+    sizes = fov_df['cell_size'].values * size_scale
+
+    # Plot each category
+    categories = fov_df[color_by].unique()
+    for cat in sorted(categories):
+        mask = fov_df[color_by] == cat
+        color = color_map.get(cat, 'gray')
+        ax.scatter(
+            x[mask],
+            y[mask],
+            s=sizes[mask],
+            c=color,
+            label=str(cat),
+            alpha=alpha,
+            edgecolors='none',
+            rasterized=True
+        )
+
+    ax.set_xlabel("Centroid X")
+    ax.set_ylabel("Centroid Y")
+    ax.set_title(f"FOV: {fov_name}\nColored by {color_by}")
+    ax.set_aspect('equal')
+
+    # Legend
+    n_cats = len(categories)
+    if n_cats <= 20:
+        ax.legend(
+            loc='center left',
+            bbox_to_anchor=(1.02, 0.5),
+            markerscale=2,
+            frameon=True,
+            fontsize=8
+        )
+    else:
+        ax.text(
+            1.02, 0.5, f"{n_cats} categories",
+            transform=ax.transAxes,
+            verticalalignment='center'
+        )
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_spatial_grid(
+    df: pd.DataFrame,
+    color_by: str,
+    color_map: dict,
+    output_path: str,
+    fovs: List[str],
+    cols: int = 3,
+    figsize_per_panel: Tuple[float, float] = (5, 5),
+    size_scale: float = 0.03,
+    alpha: float = 0.7
+) -> None:
+    """
+    Plot spatial scatter grid for multiple FOVs.
+
+    Args:
+        df: DataFrame with all data
+        color_by: Column name to color by
+        color_map: Dict mapping categories to colors
+        output_path: Path to save figure
+        fovs: List of FOV names to plot
+        cols: Number of columns in grid
+        figsize_per_panel: Size per panel
+        size_scale: Scale factor for cell sizes
+        alpha: Point transparency
+    """
+    n_fovs = len(fovs)
+    rows = (n_fovs + cols - 1) // cols
+
+    fig_width = cols * figsize_per_panel[0]
+    fig_height = rows * figsize_per_panel[1]
+
+    fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height))
+    if rows == 1 and cols == 1:
+        axes = np.array([[axes]])
+    elif rows == 1:
+        axes = axes.reshape(1, -1)
+    elif cols == 1:
+        axes = axes.reshape(-1, 1)
+
+    for idx, fov in enumerate(fovs):
+        row = idx // cols
+        col = idx % cols
+        ax = axes[row, col]
+
+        fov_df = df[df['fov'] == fov]
+
+        x = fov_df['centroid-0'].values
+        y = fov_df['centroid-1'].values
+        sizes = fov_df['cell_size'].values * size_scale
+
+        for cat in sorted(df[color_by].unique()):
+            mask = fov_df[color_by] == cat
+            if mask.sum() == 0:
+                continue
+            color = color_map.get(cat, 'gray')
+            ax.scatter(
+                x[mask],
+                y[mask],
+                s=sizes[mask],
+                c=color,
+                alpha=alpha,
+                edgecolors='none',
+                rasterized=True
+            )
+
+        ax.set_title(f"{fov}\n(n={len(fov_df):,})", fontsize=9)
+        ax.set_aspect('equal')
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    # Hide empty panels
+    for idx in range(n_fovs, rows * cols):
+        row = idx // cols
+        col = idx % cols
+        axes[row, col].axis('off')
+
+    # Add legend
+    handles = []
+    labels = []
+    for cat in sorted(df[color_by].unique()):
+        color = color_map.get(cat, 'gray')
+        handles.append(plt.Line2D([0], [0], marker='o', color='w',
+                                   markerfacecolor=color, markersize=8))
+        labels.append(str(cat))
+
+    n_cats = len(labels)
+    if n_cats <= 20:
+        fig.legend(handles, labels, loc='center right',
+                   bbox_to_anchor=(1.15, 0.5), fontsize=8)
+
+    plt.suptitle(f"Spatial plots colored by {color_by}", fontsize=12, y=1.02)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Saved: {output_path}")
+
+
+def run_spatial_scatter_visualization(
+    csv_path: str,
+    output_dir: str = 'spatial_plots',
+    n_fovs_per_nh: int = 3,
+    size_scale: float = 0.05,
+    random_state: int = 42
+) -> None:
+    """
+    Run spatial scatter visualization pipeline.
+
+    Reads a CSV with cell neighborhood data and generates scatter plots
+    using centroid coordinates, with circle sizes proportional to cell_size.
+
+    Args:
+        csv_path: Path to harmonized_level12_kmeans_nh.csv
+        output_dir: Directory for output plots
+        n_fovs_per_nh: Number of FOVs to sample per neighborhood per batch
+        size_scale: Scale factor for cell sizes
+        random_state: Random seed
+    """
+    logger.info("=" * 60)
+    logger.info("Spatial Scatter Visualization Pipeline")
+    logger.info("=" * 60)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load data
+    logger.info(f"\n[Step 1] Loading data from {csv_path}...")
+    df = pd.read_csv(csv_path)
+    logger.info(f"Loaded {len(df):,} cells from {df['fov'].nunique()} FOVs")
+
+    # Validate required columns
+    required_cols = ['cell_size', 'centroid-0', 'centroid-1', 'fov',
+                     'cell_meta_cluster', 'batch', 'kmeans_neighborhood']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    # Subsample FOVs
+    logger.info(f"\n[Step 2] Subsampling {n_fovs_per_nh} FOVs per neighborhood per batch...")
+    df_sub = subsample_fovs_per_neighborhood(df, n_fovs_per_nh, random_state)
+
+    # Generate color maps
+    logger.info("\n[Step 3] Generating color maps...")
+    cell_type_colors = get_category_colors_dict(df['cell_meta_cluster'])
+    nh_colors = get_category_colors_dict(df['kmeans_neighborhood'])
+
+    # Get list of FOVs to plot
+    fovs = sorted(df_sub['fov'].unique())
+    logger.info(f"Will generate plots for {len(fovs)} FOVs")
+
+    # Plot 1: Grid colored by cell_meta_cluster
+    logger.info("\n[Step 4] Generating grid plot colored by cell_meta_cluster...")
+    plot_spatial_grid(
+        df_sub,
+        color_by='cell_meta_cluster',
+        color_map=cell_type_colors,
+        output_path=os.path.join(output_dir, 'spatial_grid_cell_meta_cluster.png'),
+        fovs=fovs,
+        size_scale=size_scale
+    )
+
+    # Plot 2: Grid colored by kmeans_neighborhood
+    logger.info("\n[Step 5] Generating grid plot colored by kmeans_neighborhood...")
+    plot_spatial_grid(
+        df_sub,
+        color_by='kmeans_neighborhood',
+        color_map=nh_colors,
+        output_path=os.path.join(output_dir, 'spatial_grid_kmeans_neighborhood.png'),
+        fovs=fovs,
+        size_scale=size_scale
+    )
+
+    # Individual FOV plots
+    logger.info("\n[Step 6] Generating individual FOV plots...")
+    fov_dir_cluster = os.path.join(output_dir, 'by_cell_meta_cluster')
+    fov_dir_nh = os.path.join(output_dir, 'by_kmeans_neighborhood')
+    os.makedirs(fov_dir_cluster, exist_ok=True)
+    os.makedirs(fov_dir_nh, exist_ok=True)
+
+    for fov in fovs:
+        fov_df = df_sub[df_sub['fov'] == fov]
+        safe_fov = fov.replace('/', '_').replace(' ', '_')
+
+        # By cell_meta_cluster
+        plot_spatial_fov(
+            fov_df,
+            color_by='cell_meta_cluster',
+            color_map=cell_type_colors,
+            output_path=os.path.join(fov_dir_cluster, f'{safe_fov}_cell_meta_cluster.png'),
+            fov_name=fov,
+            size_scale=size_scale
+        )
+
+        # By kmeans_neighborhood
+        plot_spatial_fov(
+            fov_df,
+            color_by='kmeans_neighborhood',
+            color_map=nh_colors,
+            output_path=os.path.join(fov_dir_nh, f'{safe_fov}_kmeans_neighborhood.png'),
+            fov_name=fov,
+            size_scale=size_scale
+        )
+
+    logger.info(f"\nGenerated {len(fovs) * 2} individual FOV plots")
+
+    # Save subsampled data
+    sub_path = os.path.join(output_dir, 'subsampled_data.csv')
+    df_sub.to_csv(sub_path, index=False)
+    logger.info(f"Saved subsampled data to {sub_path}")
+
+    logger.info("\n" + "=" * 60)
+    logger.info("Spatial scatter visualization complete!")
+    logger.info(f"Plots saved to: {output_dir}/")
+    logger.info("=" * 60)
+
+
 def run_visualization(
     cluster_results_path: str,
     metadata_path: Optional[str] = None,
@@ -888,7 +1232,9 @@ def main():
 
     parser.add_argument(
         'cluster_results',
-        help='Path to *_nmf_leiden_clusters.csv file'
+        nargs='?',
+        default=None,
+        help='Path to *_nmf_leiden_clusters.csv file (not required if using --spatial-scatter)'
     )
 
     parser.add_argument(
@@ -1003,7 +1349,57 @@ def main():
         help='Column name for cell type annotations (default: cell_meta_cluster)'
     )
 
+    # ---- Spatial scatter visualization options ----
+    parser.add_argument(
+        '--spatial-scatter',
+        action='store_true',
+        help='Run spatial scatter visualization from neighborhood CSV (standalone mode)'
+    )
+
+    parser.add_argument(
+        '--spatial-scatter-csv',
+        default=None,
+        help='Path to neighborhood CSV (e.g., harmonized_level12_kmeans_nh.csv) for spatial scatter plots'
+    )
+
+    parser.add_argument(
+        '--n-fovs-per-nh',
+        type=int,
+        default=3,
+        help='Number of FOVs to sample per kmeans_neighborhood per batch'
+    )
+
+    parser.add_argument(
+        '--size-scale',
+        type=float,
+        default=0.05,
+        help='Scale factor for cell sizes in spatial scatter plots'
+    )
+
     args = parser.parse_args()
+
+    # Handle spatial scatter mode (standalone)
+    if args.spatial_scatter:
+        if args.spatial_scatter_csv is None:
+            logger.error("--spatial-scatter-csv is required when using --spatial-scatter")
+            return
+        if not os.path.exists(args.spatial_scatter_csv):
+            logger.error(f"Spatial scatter CSV not found: {args.spatial_scatter_csv}")
+            return
+
+        run_spatial_scatter_visualization(
+            csv_path=args.spatial_scatter_csv,
+            output_dir=args.output_dir,
+            n_fovs_per_nh=args.n_fovs_per_nh,
+            size_scale=args.size_scale,
+            random_state=args.seed
+        )
+        return
+
+    # For non-spatial-scatter mode, cluster_results is required
+    if args.cluster_results is None:
+        logger.error("cluster_results is required unless using --spatial-scatter mode")
+        return
 
     if not os.path.exists(args.cluster_results):
         logger.error(f"Cluster results file not found: {args.cluster_results}")
