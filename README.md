@@ -267,41 +267,65 @@ python nmf_leiden_clustering.py test_data/test_neighborhood_freqs_10000.csv \
 python nmf_leiden_clustering.py test_data/test_neighborhood_freqs_10000.csv \
     -n 5 -r 0.5 -o test_results
 
-# Generate visualizations
-python visualize.py test_results/test_neighborhood_freqs_10000_nmf_leiden_clusters.csv \
+# Generate visualizations (UMAP + PCA enabled by default)
+python visualize_expanded.py test_results/test_neighborhood_freqs_10000_nmf_leiden_clusters.csv \
     -m metadata.csv -o plots
 ```
 
 ## Visualization
 
-After running the clustering pipeline, use `visualize.py` to generate UMAP plots for quality control and batch effect detection.
+After running the clustering pipeline, use `visualize_expanded.py` to generate UMAP and PCA plots for quality control and batch effect detection.
 
 ### Basic usage
 
 ```bash
-python visualize.py results/your_file_nmf_leiden_clusters.csv -o plots
+python visualize_expanded.py results/your_file_nmf_leiden_clusters.csv -o plots
 ```
 
 ### With metadata (batch/subtype coloring)
 
 ```bash
-python visualize.py results/your_file_nmf_leiden_clusters.csv \
+python visualize_expanded.py results/your_file_nmf_leiden_clusters.csv \
     -m /path/to/harmonized_level12.csv \
     -o plots
 ```
 
 The metadata file should have columns: `fov`, `label`, `batch`, `Subtype`
 
+### Disabling PCA visualization
+
+PCA visualization is enabled by default. To disable it:
+
+```bash
+python visualize_expanded.py results/your_file_nmf_leiden_clusters.csv \
+    -m metadata.csv \
+    -o plots \
+    --no-pca
+```
+
+### Distance Metric for UMAP
+
+By default, the UMAP kNN graph uses **cosine distance** to match the clustering pipeline. This ensures the UMAP embedding reflects the same geometry used during Leiden clustering.
+
+```bash
+# Default: cosine distance (matches clustering pipeline)
+python visualize_expanded.py results.csv -o plots
+
+# Use Euclidean distance instead
+python visualize_expanded.py results.csv -o plots --umap-metric euclidean
+```
+
 ### Visualization options
 
 ```bash
-python visualize.py cluster_results.csv \
+python visualize_expanded.py cluster_results.csv \
     -m metadata.csv \
     -o plots \
     --n-neighbors 15 \
     --min-dist 0.1 \
     --point-size 1.0 \
-    --subsample 100000
+    --subsample 100000 \
+    --umap-metric cosine
 ```
 
 | Option | Default | Description |
@@ -312,6 +336,8 @@ python visualize.py cluster_results.csv \
 | `--min-dist` | 0.1 | UMAP min_dist parameter |
 | `--point-size` | 1.0 | Size of scatter points |
 | `--subsample` | None | Subsample to N cells for faster plotting |
+| `--umap-metric` | cosine | Distance metric for UMAP kNN graph (`cosine` or `euclidean`) |
+| `--no-pca` | False | Disable PCA visualization (PCA is enabled by default) |
 
 ### Output plots
 
@@ -322,6 +348,10 @@ python visualize.py cluster_results.csv \
 | `*_umap_subtype.png` | UMAP colored by subtype |
 | `*_small_multiples.png` | One panel per cluster (reveals shape, fragmentation) |
 | `*_umap_coords.csv` | UMAP coordinates for custom plotting |
+| `*_pca_clusters.png` | PCA colored by Leiden cluster |
+| `*_pca_batch.png` | PCA colored by batch |
+| `*_pca_subtype.png` | PCA colored by subtype |
+| `*_pca_coords.csv` | PCA coordinates |
 
 ### Interpreting the plots
 
@@ -335,6 +365,11 @@ python visualize.py cluster_results.csv \
 - Compact, well-defined shapes (good)
 - Fragmented clusters split across UMAP (may need different parameters)
 - Bridges between clusters (may be over-split)
+
+**PCA plots** (with `--pca`): PCA provides a linear projection complementary to UMAP:
+- Axis labels show variance explained by each PC (e.g., "PC1 (45.2% variance)")
+- Compare PCA and UMAP: if clusters separate in PCA but not UMAP (or vice versa), this reveals different aspects of the data structure
+- PCA is deterministic and faster than UMAP, useful for quick QC
 
 ## Spatial Overlay Visualization
 
