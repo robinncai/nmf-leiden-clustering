@@ -292,9 +292,10 @@ def run_leiden_clustering(
     random_state: int = 42,
     return_graph: bool = False,
     use_cosine: bool = True,
+    min_cluster_size: int = 0,
 ) -> Union[np.ndarray, Tuple[np.ndarray, scipy.sparse.csr_matrix]]:
     """
-    Run Leiden clustering on factor loadings using scanpy.
+    Run Leiden clustering on factor loadings using scanpy/leidenalg.
 
     Args:
         factor_matrix: NMF factor loadings (cells x components)
@@ -304,11 +305,15 @@ def run_leiden_clustering(
         return_graph: If True, return (labels, connectivity_matrix)
         use_cosine: If True, row-normalize W and use cosine distance for kNN graph.
                     This matches the geometry used for silhouette/DB scoring.
+        min_cluster_size: Minimum cluster size constraint (0 = no constraint).
+                          Clusters smaller than this will be merged during optimization.
 
     Returns:
         labels: Cluster assignments (if return_graph=False)
         (labels, connectivity_matrix): If return_graph=True
     """
+    import leidenalg
+
     logger.info(f"Building AnnData object with {factor_matrix.shape[0]:,} cells...")
 
     # Row-normalize if using cosine distance to match scoring geometry
@@ -334,23 +339,95 @@ def run_leiden_clustering(
         random_state=random_state,
     )
 
-    logger.info(f"Running Leiden clustering with resolution={resolution}...")
+    # Convert scanpy connectivity to igraph for leidenalg
+    connectivity_matrix = adata.obsp["connectivities"]
 
-    sc.tl.leiden(
-        adata,
-        resolution=resolution,
-        random_state=random_state,
-        flavor="igraph",
+    # Build igraph graph from adjacency matrix
+    sources, targets = connectivity_matrix.nonzero()
+    weights = connectivity_matrix[sources, targets].A1  # Get weights as 1D array
+    g = ig.Graph(directed=False)
+    g.add_vertices(connectivity_matrix.shape[0])
+    edges = list(zip(sources.tolist(), targets.tolist()))
+    g.add_edges(edges)
+    g.es["weight"] = weights.tolist()
+
+    # Run Leiden with leidenalg directly
+    logger.info(f"Running Leiden clustering with resolution={resolution}...")
+    partition = leidenalg.find_partition(
+        g,
+        leidenalg.RBConfigurationVertexPartition,
+        resolution_parameter=resolution,
+        seed=random_state,
         n_iterations=2,
+        weights="weight",
     )
 
-    cluster_labels = adata.obs["leiden"].values.astype(int)
+    cluster_labels = np.array(partition.membership)
     n_clusters = len(np.unique(cluster_labels))
-    logger.info(f"Found {n_clusters} clusters")
+    logger.info(f"Found {n_clusters} initial clusters")
 
-    # NEW: Optionally return connectivity matrix
+    if min_cluster_size > 0:
+        # Post-process: merge small clusters by reassigning cells to nearest large cluster
+        logger.info(f"Enforcing minimum cluster size of {min_cluster_size} via post-processing...")
+
+        iteration = 0
+        max_iterations = 100  # Safety limit
+
+        while iteration < max_iterations:
+            unique_labels, counts = np.unique(cluster_labels, return_counts=True)
+            small_mask = counts < min_cluster_size
+
+            if not np.any(small_mask):
+                break  # All clusters meet minimum size
+
+            small_clusters = unique_labels[small_mask]
+            large_clusters = unique_labels[~small_mask]
+
+            if len(large_clusters) == 0:
+                logger.warning("No clusters meet minimum size requirement. Keeping all clusters.")
+                break
+
+            # Compute centroids of large clusters in the normalized factor space
+            large_centroids = {}
+            for lc in large_clusters:
+                large_centroids[lc] = W_normalized[cluster_labels == lc].mean(axis=0)
+
+            # Reassign cells from small clusters to nearest large cluster centroid
+            for small_cluster in small_clusters:
+                sc_mask = cluster_labels == small_cluster
+                sc_cells = W_normalized[sc_mask]
+
+                # Find nearest large cluster for each cell
+                best_labels = np.zeros(sc_cells.shape[0], dtype=int)
+                for i, cell in enumerate(sc_cells):
+                    min_dist = np.inf
+                    best_lc = large_clusters[0]
+                    for lc in large_clusters:
+                        dist = np.linalg.norm(cell - large_centroids[lc])
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_lc = lc
+                    best_labels[i] = best_lc
+
+                cluster_labels[sc_mask] = best_labels
+
+            iteration += 1
+
+        # Relabel clusters to be contiguous (0, 1, 2, ...)
+        unique_labels = np.unique(cluster_labels)
+        label_map = {old: new for new, old in enumerate(unique_labels)}
+        cluster_labels = np.array([label_map[l] for l in cluster_labels])
+
+        n_clusters = len(np.unique(cluster_labels))
+        logger.info(f"After merging small clusters: {n_clusters} clusters")
+
+        # Report cluster size distribution
+        unique, counts = np.unique(cluster_labels, return_counts=True)
+        min_size = counts.min()
+        logger.info(f"Minimum cluster size: {min_size} (target: {min_cluster_size})")
+
+    # Optionally return connectivity matrix
     if return_graph:
-        connectivity_matrix = adata.obsp["connectivities"]
         return cluster_labels, connectivity_matrix
     else:
         return cluster_labels
@@ -408,6 +485,7 @@ def run_leiden_with_labels(
     random_state: int = 42,
     return_graph: bool = False,
     use_cosine: bool = True,
+    min_cluster_size: int = 0,
 ) -> Union[np.ndarray, Tuple[np.ndarray, scipy.sparse.csr_matrix]]:
     """
     Run Leiden clustering and return labels (quiet version for tuning).
@@ -419,11 +497,14 @@ def run_leiden_with_labels(
         random_state: Random seed
         return_graph: If True, return (labels, connectivity_matrix)
         use_cosine: If True, row-normalize W and use cosine distance for kNN graph.
+        min_cluster_size: Minimum cluster size constraint (0 = no constraint).
 
     Returns:
         labels: Cluster assignments (if return_graph=False)
         (labels, connectivity_matrix): If return_graph=True
     """
+    import leidenalg
+
     # Row-normalize if using cosine distance to match scoring geometry
     if use_cosine:
         row_sums = factor_matrix.sum(axis=1, keepdims=True)
@@ -443,19 +524,42 @@ def run_leiden_with_labels(
         random_state=random_state,
     )
 
-    sc.tl.leiden(
-        adata,
-        resolution=resolution,
-        random_state=random_state,
-        flavor="igraph",
-        n_iterations=2,
-    )
+    # Convert scanpy connectivity to igraph for leidenalg
+    connectivity_matrix = adata.obsp["connectivities"]
 
-    cluster_labels = adata.obs["leiden"].values.astype(int)
+    # Build igraph graph from adjacency matrix
+    sources, targets = connectivity_matrix.nonzero()
+    weights = connectivity_matrix[sources, targets].A1
+    g = ig.Graph(directed=False)
+    g.add_vertices(connectivity_matrix.shape[0])
+    edges = list(zip(sources.tolist(), targets.tolist()))
+    g.add_edges(edges)
+    g.es["weight"] = weights.tolist()
 
-    # NEW: Optionally return connectivity matrix
+    # Run Leiden with leidenalg directly
+    if min_cluster_size > 0:
+        partition = leidenalg.find_partition(
+            g,
+            leidenalg.RBConfigurationVertexPartition,
+            resolution_parameter=resolution,
+            seed=random_state,
+            n_iterations=2,
+            weights="weight",
+            min_comm_size=min_cluster_size,
+        )
+    else:
+        partition = leidenalg.find_partition(
+            g,
+            leidenalg.RBConfigurationVertexPartition,
+            resolution_parameter=resolution,
+            seed=random_state,
+            n_iterations=2,
+            weights="weight",
+        )
+
+    cluster_labels = np.array(partition.membership)
+
     if return_graph:
-        connectivity_matrix = adata.obsp["connectivities"]
         return cluster_labels, connectivity_matrix
     else:
         return cluster_labels
@@ -1243,6 +1347,7 @@ def save_cli_args(
             f.write("LEIDEN PARAMETERS:\n")
             f.write(f"  resolution:        {args.resolution}\n")
             f.write(f"  n_neighbors:       {args.n_neighbors}\n")
+            f.write(f"  min_cluster_size:  {args.min_cluster_size}\n")
             f.write(f"  kNN metric:        {'euclidean (raw W)' if args.euclidean else 'cosine (row-normalized W)'}\n")
             f.write("\n")
 
@@ -1333,6 +1438,7 @@ def run_pipeline(
     subsample_fraction: float = 0.1,
     run_svd: bool = False,
     use_cosine: bool = True,
+    min_cluster_size_str: str = "1%",
     args: Optional[argparse.Namespace] = None,
 ) -> pd.DataFrame:
     """
@@ -1408,6 +1514,10 @@ def run_pipeline(
 
     del data_matrix
 
+    # Parse minimum cluster size (can be integer or percentage like "1%")
+    n_cells = len(metadata_df)
+    min_cluster_size = parse_min_cluster_size(min_cluster_size_str, n_cells)
+
     logger.info("\n[Step 5/6] Running Leiden clustering...")
     cluster_labels, connectivity_matrix = run_leiden_clustering(
         W,
@@ -1416,6 +1526,7 @@ def run_pipeline(
         random_state=random_state,
         use_cosine=use_cosine,
         return_graph=True,
+        min_cluster_size=min_cluster_size,
     )
 
     # Compute and report clustering quality metrics (excluding ARI which requires stability testing)
@@ -1467,6 +1578,26 @@ def run_pipeline(
     logger.info("Pipeline complete!")
     logger.info("=" * 60)
 
+    # Save job summary for tracking across runs
+    project_root = Path(__file__).parent
+    log_dir = project_root / "log"
+    results_parent = project_root / "results" / "nmf_leiden"
+
+    save_job_summary(
+        output_dir=output_dir,
+        n_components=n_components,
+        k_neighbors=n_neighbors,
+        resolution=resolution,
+        n_cells=len(metadata_df),
+        n_clusters=stats.get('n_clusters', len(np.unique(cluster_labels))),
+        status="Complete",
+        log_dir=str(log_dir) if log_dir.exists() else None,
+    )
+
+    # Also save overall summary to results parent directory
+    if results_parent.exists():
+        update_overall_summary(str(log_dir), str(results_parent))
+
     result_df = metadata_df.copy()
     result_df["leiden_cluster"] = cluster_labels
     for i in range(W.shape[1]):
@@ -1481,6 +1612,31 @@ def parse_int_list(s: str) -> List[int]:
 
 def parse_float_list(s: str) -> List[float]:
     return [float(x.strip()) for x in s.split(",")]
+
+
+def parse_min_cluster_size(s: str, n_cells: int) -> int:
+    """
+    Parse minimum cluster size from string.
+
+    Args:
+        s: String specifying min cluster size. Can be:
+           - An integer (e.g., "100")
+           - A percentage (e.g., "1%" or "0.5%")
+        n_cells: Total number of cells (used for percentage calculation)
+
+    Returns:
+        Minimum cluster size as integer
+    """
+    s = s.strip()
+    if s.endswith("%"):
+        # Percentage of total cells
+        pct = float(s[:-1])
+        min_size = int(np.ceil(n_cells * pct / 100.0))
+        logger.info(f"Minimum cluster size: {pct}% of {n_cells:,} cells = {min_size:,} cells")
+        return min_size
+    else:
+        # Absolute integer
+        return int(s)
 
 
 def main():
@@ -1608,6 +1764,15 @@ def main():
              "Default uses cosine to match the geometry of silhouette/DB scoring.",
     )
 
+    parser.add_argument(
+        "--min-cluster-size",
+        type=str,
+        default="1%",
+        help="Minimum cluster size constraint for Leiden clustering. "
+             "Can be an integer (e.g., '100') or a percentage of total cells (e.g., '1%%'). "
+             "Default: 1%% of total cells.",
+    )
+
     args = parser.parse_args()
 
     if not os.path.exists(args.input_file):
@@ -1656,8 +1821,95 @@ def main():
             subsample_fraction=args.subsample_fraction,
             run_svd=args.svd,
             use_cosine=use_cosine,
+            min_cluster_size_str=args.min_cluster_size,
             args=args,
         )
+
+
+def save_job_summary(
+    output_dir: str,
+    job_id: Optional[str] = None,
+    n_components: Optional[int] = None,
+    k_neighbors: Optional[int] = None,
+    resolution: Optional[float] = None,
+    n_cells: Optional[int] = None,
+    n_clusters: Optional[int] = None,
+    status: str = "Complete",
+    log_dir: Optional[str] = None,
+) -> None:
+    """
+    Save a summary of the current job and update the overall summary table.
+
+    Args:
+        output_dir: Directory to save the summary
+        job_id: Job ID (e.g., SLURM_JOB_ID)
+        n_components: Number of NMF components used
+        k_neighbors: Number of kNN neighbors used
+        resolution: Leiden resolution used
+        n_cells: Number of cells processed
+        n_clusters: Number of clusters found
+        status: Job status string
+        log_dir: Directory containing all log files (for updating overall summary)
+    """
+    # Get job ID from environment if not provided
+    if job_id is None:
+        job_id = os.environ.get('SLURM_JOB_ID', 'unknown')
+
+    # Save current job summary
+    job_summary = {
+        'job_id': job_id,
+        'n_components': n_components,
+        'k_neighbors': k_neighbors,
+        'resolution': resolution,
+        'n_cells': n_cells,
+        'n_clusters': n_clusters,
+        'status': status,
+        'timestamp': datetime.now().isoformat(),
+    }
+
+    summary_path = os.path.join(output_dir, 'job_summary.json')
+    with open(summary_path, 'w') as f:
+        json.dump(job_summary, f, indent=2)
+    logger.info(f"Saved job summary to {summary_path}")
+
+    # Update overall summary table if log_dir provided
+    if log_dir is not None:
+        update_overall_summary(log_dir, output_dir)
+
+
+def update_overall_summary(log_dir: str, results_dir: str) -> None:
+    """
+    Parse all log files and update the overall summary table.
+
+    Args:
+        log_dir: Directory containing log files
+        results_dir: Directory to save the summary CSV/markdown
+    """
+    try:
+        # Import parsing functions from parse_nmf_logs.py
+        from parse_nmf_logs import parse_all_logs, generate_summary_table
+
+        df = parse_all_logs(log_dir, exclude_subfolders=True)
+
+        if len(df) == 0:
+            logger.warning(f"No log files found in {log_dir}")
+            return
+
+        # Save CSV
+        csv_path = os.path.join(results_dir, 'all_jobs_summary.csv')
+        df.to_csv(csv_path, index=False)
+        logger.info(f"Saved overall job summary to {csv_path}")
+
+        # Save markdown
+        md_path = os.path.join(results_dir, 'all_jobs_summary.md')
+        with open(md_path, 'w') as f:
+            f.write(generate_summary_table(df))
+        logger.info(f"Saved markdown summary to {md_path}")
+
+    except ImportError:
+        logger.warning("parse_nmf_logs.py not found, skipping overall summary update")
+    except Exception as e:
+        logger.warning(f"Could not update overall summary: {e}")
 
 
 if __name__ == "__main__":

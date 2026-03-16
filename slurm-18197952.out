@@ -1,0 +1,33 @@
+============================================================
+NMF Leiden Clustering - Array Job Submission
+============================================================
+Config file: /scratch/groups/sartandi/rcai2/projects/nmf-leiden-clustering/config/nmf_leiden_configs.txt
+Number of configurations: 6
+
+Configurations to run:
+  1) 5 60 0.05
+  2) 5 60 0.1
+  3) 5 90 0.05
+  4) 5 90 0.1
+  5) 5 120 0.05
+  6) 5 120 0.1
+
+============================================================
+Submitting array job...
+
+Submitted job array: 18198035
+Array tasks: 1-6
+
+Submitting aggregation job (depends on array completion)...
+Aggregation job: 18198040 (will run after array completes)
+
+Monitor with:
+  squeue -j 18198035
+  tail -f /scratch/groups/sartandi/rcai2/projects/nmf-leiden-clustering/log/nmf_leiden_18198035_*.log
+
+Results will be saved to:
+  /scratch/groups/sartandi/rcai2/projects/nmf-leiden-clustering/results/nmf_leiden/18198035/
+
+After completion, aggregate with:
+  bash bash_scripts/aggregate_job_results.sh 18198035
+============================================================

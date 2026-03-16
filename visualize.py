@@ -630,6 +630,364 @@ def plot_cluster_celltype_heatmap(
     logger.info(f"Saved composition matrix: {csv_path}")
 
 
+def plot_neighborhood_composition_heatmap(
+    df: pd.DataFrame,
+    freq_cols: List[str],
+    output_path: str,
+    cluster_col: str = 'leiden_cluster',
+    figsize: Tuple[int, int] = (14, 10),
+    cmap: str = 'viridis',
+    annot: bool = True,
+    fmt: str = '.2f'
+) -> None:
+    """
+    Create a heatmap showing average neighborhood composition for each cluster.
+
+    This shows the mean neighborhood frequency profile (average of frequency columns)
+    for cells in each cluster - i.e., what is the typical neighborhood environment
+    for cells in each cluster.
+
+    Args:
+        df: DataFrame with cluster labels and frequency columns
+        freq_cols: List of frequency column names (e.g., ['Cancer cell', 'APC', ...])
+        output_path: Path to save the heatmap
+        cluster_col: Column name for cluster labels
+        figsize: Figure size (width, height)
+        cmap: Colormap for heatmap
+        annot: Whether to annotate cells with values
+        fmt: Format string for annotations
+    """
+    logger.info(f"Creating neighborhood composition heatmap...")
+
+    # Calculate mean frequency for each cluster
+    composition = df.groupby(cluster_col)[freq_cols].mean()
+
+    # Sort by cluster index
+    composition = composition.sort_index()
+
+    logger.info(f"Neighborhood composition matrix: {composition.shape[0]} clusters x {composition.shape[1]} cell types")
+
+    # Create heatmap
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Determine annotation based on matrix size
+    if composition.shape[0] * composition.shape[1] > 500:
+        annot_flag = False
+        logger.info("Large matrix detected, disabling cell annotations")
+    else:
+        annot_flag = annot
+
+    sns.heatmap(
+        composition,
+        cmap=cmap,
+        annot=annot_flag,
+        fmt=fmt,
+        cbar_kws={'label': 'Mean Frequency'},
+        ax=ax,
+        linewidths=0.5 if composition.shape[0] < 30 else 0,
+        linecolor='white' if composition.shape[0] < 30 else None
+    )
+
+    ax.set_xlabel('Cell Type (in neighborhood)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Cluster', fontsize=12, fontweight='bold')
+    ax.set_title('Neighborhood Composition by Cluster\n(Mean frequency of cell types in neighborhood)',
+                 fontsize=14, fontweight='bold', pad=20)
+
+    # Rotate x-axis labels for better readability
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Saved neighborhood composition heatmap: {output_path}")
+
+    # Also save the composition matrix as CSV
+    csv_path = output_path.replace('.png', '_data.csv')
+    composition.to_csv(csv_path)
+    logger.info(f"Saved neighborhood composition data: {csv_path}")
+
+
+def plot_cluster_stacked_bar(
+    df: pd.DataFrame,
+    output_path: str,
+    cluster_col: str = 'leiden_cluster',
+    group_col: str = 'batch',
+    normalize: bool = True,
+    figsize: Tuple[int, int] = (14, 8),
+    title: str = None
+) -> None:
+    """
+    Create a stacked bar plot showing cluster composition by a grouping variable.
+
+    Args:
+        df: DataFrame with cluster and group columns
+        output_path: Path to save the figure
+        cluster_col: Column name for cluster labels (x-axis)
+        group_col: Column name for grouping variable (stacked colors)
+        normalize: If True, show proportions; if False, show counts
+        figsize: Figure size (width, height)
+        title: Plot title (auto-generated if None)
+    """
+    logger.info(f"Creating stacked bar plot: {cluster_col} by {group_col}...")
+
+    # Create crosstab
+    if normalize:
+        crosstab = pd.crosstab(df[cluster_col], df[group_col], normalize='index')
+        ylabel = 'Proportion'
+    else:
+        crosstab = pd.crosstab(df[cluster_col], df[group_col])
+        ylabel = 'Cell Count'
+
+    # Sort by cluster index
+    crosstab = crosstab.sort_index()
+
+    # Get colors
+    n_groups = len(crosstab.columns)
+    if n_groups <= 10:
+        colors = plt.cm.tab10.colors[:n_groups]
+    elif n_groups <= 20:
+        colors = plt.cm.tab20.colors[:n_groups]
+    else:
+        colors = [plt.cm.gist_ncar(i / n_groups) for i in range(n_groups)]
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Plot stacked bars
+    crosstab.plot(
+        kind='bar',
+        stacked=True,
+        ax=ax,
+        color=colors,
+        width=0.8,
+        edgecolor='white',
+        linewidth=0.5
+    )
+
+    # Customize
+    ax.set_xlabel('Cluster', fontsize=12, fontweight='bold')
+    ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
+
+    if title is None:
+        title = f'Cluster Composition by {group_col}' + (' (Proportions)' if normalize else ' (Counts)')
+    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
+
+    # Rotate x-axis labels
+    plt.xticks(rotation=0 if len(crosstab) < 20 else 45, ha='right' if len(crosstab) >= 20 else 'center')
+
+    # Legend
+    ax.legend(
+        title=group_col,
+        bbox_to_anchor=(1.02, 1),
+        loc='upper left',
+        fontsize=9,
+        title_fontsize=10
+    )
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Saved stacked bar plot: {output_path}")
+
+    # Save data as CSV
+    csv_path = output_path.replace('.png', '_data.csv')
+    crosstab.to_csv(csv_path)
+    logger.info(f"Saved stacked bar data: {csv_path}")
+
+
+def plot_pca_on_frequencies(
+    df: pd.DataFrame,
+    freq_cols: List[str],
+    cluster_labels: np.ndarray,
+    output_path: str,
+    n_comps: int = 10,
+    scale: bool = True,
+    point_size: float = 1.0,
+    alpha: float = 0.5,
+    random_state: int = 42,
+    title: str = "PCA on Original Neighborhood Frequencies"
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute and plot PCA on original neighborhood frequency features.
+
+    Args:
+        df: DataFrame containing frequency columns
+        freq_cols: List of frequency column names
+        cluster_labels: Cluster assignments for coloring
+        output_path: Path to save the figure
+        n_comps: Number of PCA components to compute
+        scale: Whether to z-score features before PCA
+        point_size: Size of scatter points
+        alpha: Point transparency
+        random_state: Random seed
+        title: Plot title
+
+    Returns:
+        pca_coords: PCA coordinates (cells x n_comps)
+        explained_variance_ratio: Variance explained by each component
+    """
+    logger.info(f"Computing PCA on {len(freq_cols)} frequency features...")
+
+    # Extract frequency matrix
+    freq_matrix = df[freq_cols].values.astype(np.float32)
+
+    # Create AnnData and compute PCA
+    adata = ad.AnnData(freq_matrix)
+
+    if scale:
+        sc.pp.scale(adata, zero_center=True, max_value=10)
+
+    sc.tl.pca(
+        adata,
+        n_comps=min(n_comps, freq_matrix.shape[1] - 1),
+        svd_solver='arpack',
+        random_state=random_state
+    )
+
+    pca_coords = adata.obsm['X_pca']
+    explained_variance_ratio = adata.uns['pca']['variance_ratio']
+
+    logger.info(f"PCA complete: PC1={explained_variance_ratio[0]*100:.2f}%, PC2={explained_variance_ratio[1]*100:.2f}%")
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    unique_clusters = np.unique(cluster_labels)
+    n_clusters = len(unique_clusters)
+    colors = get_cluster_colors(n_clusters)
+
+    for i, cluster in enumerate(sorted(unique_clusters)):
+        mask = cluster_labels == cluster
+        ax.scatter(
+            pca_coords[mask, 0],
+            pca_coords[mask, 1],
+            c=colors[i],
+            label=f"Cluster {cluster}",
+            s=point_size,
+            alpha=alpha,
+            rasterized=True
+        )
+
+    ax.set_xlabel(f"PC1 ({explained_variance_ratio[0]*100:.1f}% variance)", fontsize=12)
+    ax.set_ylabel(f"PC2 ({explained_variance_ratio[1]*100:.1f}% variance)", fontsize=12)
+    ax.set_title(title, fontsize=14, fontweight='bold')
+
+    if n_clusters <= 20:
+        ax.legend(
+            loc='center left',
+            bbox_to_anchor=(1.02, 0.5),
+            markerscale=5,
+            frameon=True
+        )
+    else:
+        ax.text(
+            1.02, 0.5, f"{n_clusters} clusters",
+            transform=ax.transAxes,
+            verticalalignment='center'
+        )
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Saved frequency PCA plot: {output_path}")
+
+    return pca_coords, explained_variance_ratio
+
+
+# ============================================================================
+# KDE DENSITY PLOTS AND BATCH EFFECT ANALYSIS (from KMEANS pipeline)
+# ============================================================================
+
+def plot_pca_kde(
+    pca_coords: np.ndarray,
+    labels: np.ndarray,
+    output_path: str,
+    title: str = "PCA Density Contours",
+    label_name: str = "cluster",
+    figsize: Tuple[int, int] = (10, 8),
+    explained_variance_ratio: np.ndarray = None,
+    levels: int = 5,
+    thresh: float = 0.02,
+    linewidths: float = 2.0
+) -> None:
+    """
+    Plot KDE density contours of PCA results colored by a categorical variable.
+
+    This matches the visualization style from the KMEANS pipeline.
+
+    Args:
+        pca_coords: PCA coordinates (cells x 2)
+        labels: Category labels for each cell (cluster, batch, etc.)
+        output_path: Path to save figure
+        title: Plot title
+        label_name: Name for the legend (e.g., "cluster", "batch")
+        figsize: Figure size
+        explained_variance_ratio: Variance explained by each PC (for axis labels)
+        levels: Number of contour levels
+        thresh: Threshold for KDE (lowest density contour)
+        linewidths: Width of contour lines
+    """
+    # Build DataFrame for seaborn
+    df_pca = pd.DataFrame({
+        "PC1": pca_coords[:, 0],
+        "PC2": pca_coords[:, 1],
+        "label": labels
+    })
+
+    # Generate colors
+    unique_labels = sorted(df_pca["label"].unique())
+    n_labels = len(unique_labels)
+
+    if n_labels <= 10:
+        palette = sns.color_palette("tab10", n_labels)
+    elif n_labels <= 20:
+        palette = sns.color_palette("tab20", n_labels)
+    else:
+        palette = sns.color_palette("husl", n_labels)
+
+    label_colors = {lab: palette[i] for i, lab in enumerate(unique_labels)}
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    sns.kdeplot(
+        data=df_pca,
+        x="PC1",
+        y="PC2",
+        hue="label",
+        palette=label_colors,
+        levels=levels,
+        thresh=thresh,
+        linewidths=linewidths,
+        common_norm=False,
+        ax=ax,
+    )
+
+    if ax.legend_ is not None:
+        ax.legend_.set_title(label_name.capitalize())
+        # Move legend outside if many categories
+        if n_labels > 10:
+            ax.legend(
+                loc='center left',
+                bbox_to_anchor=(1.02, 0.5),
+                title=label_name.capitalize()
+            )
+
+    # Add variance explained to axis labels if provided
+    if explained_variance_ratio is not None and len(explained_variance_ratio) >= 2:
+        ax.set_xlabel(f"PC1 ({explained_variance_ratio[0]*100:.1f}% variance)")
+        ax.set_ylabel(f"PC2 ({explained_variance_ratio[1]*100:.1f}% variance)")
+    else:
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+
+    ax.set_title(title)
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Saved KDE plot: {output_path}")
+
+
 # ============================================================================
 # SPATIAL SCATTER VISUALIZATION (Centroid-based)
 # ============================================================================
@@ -1201,7 +1559,12 @@ def run_visualization(
     do_umap: bool = False,
     # PCA visualization (direct PCA, not PCA->UMAP)
     do_pca: bool = True,
-    cell_type_col: str = 'cell_meta_cluster'
+    cell_type_col: str = 'cell_meta_cluster',
+    # Frequency-based PCA
+    freq_csv_path: Optional[str] = None,
+    do_freq_pca: bool = False,
+    # KDE density contour plots (KMEANS-style visualization)
+    do_kde: bool = False
 ) -> None:
     """
     Run full visualization pipeline.
@@ -1354,6 +1717,42 @@ def run_visualization(
                     point_size=point_size
                 )
 
+        # ---- KDE density contour plots (KMEANS-style visualization) ----
+        if do_kde:
+            logger.info("\n[Step 5.2] Generating KDE density contour plots (NMF space)...")
+
+            # KDE plot colored by cluster
+            plot_pca_kde(
+                pca_coords[:, :2],
+                cluster_labels,
+                os.path.join(output_dir, f'{basename}_pca_kde_clusters.png'),
+                title="PCA Density Contours by Cluster (NMF space)",
+                label_name="cluster",
+                explained_variance_ratio=explained_var
+            )
+
+            # KDE plot colored by batch if available
+            if has_metadata and 'batch' in df.columns and df['batch'].notna().any():
+                plot_pca_kde(
+                    pca_coords[:, :2],
+                    df['batch'].fillna('Unknown').values,
+                    os.path.join(output_dir, f'{basename}_pca_kde_batch.png'),
+                    title="PCA Density Contours by Batch (NMF space)",
+                    label_name="batch",
+                    explained_variance_ratio=explained_var
+                )
+
+            # KDE plot colored by subtype if available
+            if has_metadata and 'Subtype' in df.columns and df['Subtype'].notna().any():
+                plot_pca_kde(
+                    pca_coords[:, :2],
+                    df['Subtype'].fillna('Unknown').values,
+                    os.path.join(output_dir, f'{basename}_pca_kde_subtype.png'),
+                    title="PCA Density Contours by Subtype (NMF space)",
+                    label_name="subtype",
+                    explained_variance_ratio=explained_var
+                )
+
     if has_metadata and do_umap and umap_coords is not None:
         if 'batch' in df.columns and df['batch'].notna().any():
             plot_umap_metadata(
@@ -1394,6 +1793,139 @@ def run_visualization(
         )
     else:
         logger.warning(f"Cell type column '{cell_type_col}' not found in data. Skipping heatmap.")
+
+    # ---- Stacked Bar Plots for Batch and Subtype ----
+    if has_metadata:
+        logger.info("\n[Step 5.6] Generating stacked bar plots...")
+
+        if 'batch' in df.columns and df['batch'].notna().any():
+            # Batch - proportions
+            plot_cluster_stacked_bar(
+                df=df[df['batch'].notna()],
+                output_path=os.path.join(output_dir, f'{basename}_cluster_batch_proportions.png'),
+                cluster_col='leiden_cluster',
+                group_col='batch',
+                normalize=True,
+                title='Cluster Composition by Batch (Proportions)'
+            )
+            # Batch - counts
+            plot_cluster_stacked_bar(
+                df=df[df['batch'].notna()],
+                output_path=os.path.join(output_dir, f'{basename}_cluster_batch_counts.png'),
+                cluster_col='leiden_cluster',
+                group_col='batch',
+                normalize=False,
+                title='Cluster Composition by Batch (Cell Counts)'
+            )
+
+        if 'Subtype' in df.columns and df['Subtype'].notna().any():
+            # Subtype - proportions
+            plot_cluster_stacked_bar(
+                df=df[df['Subtype'].notna()],
+                output_path=os.path.join(output_dir, f'{basename}_cluster_subtype_proportions.png'),
+                cluster_col='leiden_cluster',
+                group_col='Subtype',
+                normalize=True,
+                title='Cluster Composition by Cancer Subtype (Proportions)'
+            )
+            # Subtype - counts
+            plot_cluster_stacked_bar(
+                df=df[df['Subtype'].notna()],
+                output_path=os.path.join(output_dir, f'{basename}_cluster_subtype_counts.png'),
+                cluster_col='leiden_cluster',
+                group_col='Subtype',
+                normalize=False,
+                title='Cluster Composition by Cancer Subtype (Cell Counts)'
+            )
+
+    # ---- Frequency-based PCA ----
+    if do_freq_pca and freq_csv_path:
+        logger.info("\n[Step 5.7] Generating PCA on original neighborhood frequencies...")
+
+        if not os.path.exists(freq_csv_path):
+            logger.error(f"Frequency CSV not found: {freq_csv_path}")
+        else:
+            # Load original frequency data
+            logger.info(f"Loading frequency data from {freq_csv_path}...")
+            df_freq = pd.read_csv(freq_csv_path)
+
+            # Merge with cluster results to get cluster labels
+            df_freq_merged = df_freq.merge(
+                df[['fov', 'label', 'leiden_cluster']],
+                on=['fov', 'label'],
+                how='inner'
+            )
+            logger.info(f"Merged {len(df_freq_merged):,} cells for frequency PCA")
+
+            # Identify frequency columns (exclude metadata columns)
+            metadata_cols = ['fov', 'label', 'cell_meta_cluster', 'leiden_cluster']
+            freq_cols = [c for c in df_freq_merged.columns if c not in metadata_cols]
+            logger.info(f"Frequency columns: {freq_cols}")
+
+            # Generate PCA plot
+            plot_pca_on_frequencies(
+                df=df_freq_merged,
+                freq_cols=freq_cols,
+                cluster_labels=df_freq_merged['leiden_cluster'].values,
+                output_path=os.path.join(output_dir, f'{basename}_pca_frequencies.png'),
+                n_comps=10,
+                scale=True,
+                point_size=point_size,
+                random_state=random_state,
+                title="PCA on Original Neighborhood Frequencies (Z-scored)"
+            )
+
+            # Generate neighborhood composition heatmap
+            plot_neighborhood_composition_heatmap(
+                df=df_freq_merged,
+                freq_cols=freq_cols,
+                output_path=os.path.join(output_dir, f'{basename}_neighborhood_composition_heatmap.png'),
+                cluster_col='leiden_cluster',
+                figsize=(14, 10),
+                cmap='viridis',
+                annot=True,
+                fmt='.3f'
+            )
+
+            # ---- KDE density contour plots (KMEANS-style visualization) ----
+            if do_kde:
+                # Get PCA coordinates for KDE plot
+                freq_matrix = df_freq_merged[freq_cols].values.astype(np.float32)
+                adata_kde = ad.AnnData(freq_matrix)
+                sc.pp.scale(adata_kde, zero_center=True, max_value=10)
+                sc.tl.pca(adata_kde, n_comps=2, svd_solver='arpack', random_state=random_state)
+                pca_coords_kde = adata_kde.obsm['X_pca']
+                explained_var_kde = adata_kde.uns['pca']['variance_ratio']
+
+                # KDE plot colored by cluster
+                plot_pca_kde(
+                    pca_coords_kde,
+                    df_freq_merged['leiden_cluster'].values,
+                    os.path.join(output_dir, f'{basename}_pca_frequencies_kde_clusters.png'),
+                    title="PCA Density Contours by Cluster (Original Frequencies)",
+                    label_name="cluster",
+                    explained_variance_ratio=explained_var_kde
+                )
+
+                # KDE plot colored by batch if available
+                if has_metadata and 'batch' in df.columns:
+                    # Merge batch info if not already present
+                    if 'batch' not in df_freq_merged.columns:
+                        df_freq_merged = df_freq_merged.merge(
+                            df[['fov', 'label', 'batch']],
+                            on=['fov', 'label'],
+                            how='left'
+                        )
+
+                    if df_freq_merged['batch'].notna().any():
+                        plot_pca_kde(
+                            pca_coords_kde,
+                            df_freq_merged['batch'].fillna('Unknown').values,
+                            os.path.join(output_dir, f'{basename}_pca_frequencies_kde_batch.png'),
+                            title="PCA Density Contours by Batch (Original Frequencies)",
+                            label_name="batch",
+                            explained_variance_ratio=explained_var_kde
+                        )
 
     # ---- PCA UMAP (optional) ----
     if do_pca_umap:
@@ -1610,6 +2142,26 @@ def main():
         help='Column name for cell type annotations (default: cell_meta_cluster)'
     )
 
+    # ---- Frequency-based PCA options ----
+    parser.add_argument(
+        '--freq-csv',
+        default=None,
+        help='Path to original neighborhood frequency CSV for frequency-based PCA plot'
+    )
+
+    parser.add_argument(
+        '--freq-pca',
+        action='store_true',
+        help='Generate PCA plot on original neighborhood frequencies (requires --freq-csv)'
+    )
+
+    # ---- KDE density contour plots (KMEANS-style visualization) ----
+    parser.add_argument(
+        '--kde',
+        action='store_true',
+        help='Generate KDE density contour plots in addition to scatter plots (KMEANS-style visualization)'
+    )
+
     # ---- Spatial scatter visualization options ----
     parser.add_argument(
         '--spatial-scatter',
@@ -1687,7 +2239,10 @@ def main():
         umap_metric=args.umap_metric,
         do_umap=args.umap,
         do_pca=(args.pca and not args.no_pca),
-        cell_type_col=args.cell_type_col
+        cell_type_col=args.cell_type_col,
+        freq_csv_path=args.freq_csv,
+        do_freq_pca=args.freq_pca,
+        do_kde=args.kde
     )
 
 
