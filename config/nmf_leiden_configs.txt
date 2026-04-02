@@ -4,11 +4,21 @@
 # Format: n k r
 # Example: 8 60 0.2 means n_components=8, n_neighbors=60, resolution=0.2
 
-# Default configurations to explore
+# Previously run (job 19137392) — commented out
 # --- LOW DIMENSION ---
-5 60 0.05
-5 60 0.1
-5 90 0.05
-5 90 0.1
-5 120 0.05
-5 120 0.1
+# 5 60 0.05
+# 5 60 0.1
+# 5 90 0.05
+# 5 90 0.1
+# 5 120 0.05
+# 5 120 0.1
+
+# --- LOWER NMF DIMENSIONS (n=3, n=4) ---
+3 60 0.05
+3 60 0.10
+4 60 0.05
+4 60 0.10
+
+# --- LOWER RESOLUTION (fewer clusters, n=5) ---
+5 60 0.01
+5 60 0.02

@@ -40,8 +40,8 @@ VIS="${ROOT}/visualize.py"
 CONFIG="${ROOT}/config/nmf_leiden_configs.txt"
 
 # --- Input data ---
-IN_CSV="/scratch/groups/sartandi/rcai2/projects/KMEANS/results/all_12type_no_other/spatial_analysis/neighborhood_mats/neighborhood_freqs-cell_meta_cluster_radius200.csv"
-META="/scratch/groups/sartandi/rcai2/projects/KMEANS/data/harmonized_level12.csv"
+IN_CSV="/scratch/groups/sartandi/rcai2/projects/KMEANS/results/all_15type_full/spatial_analysis/neighborhood_mats/neighborhood_freqs-cell_meta_cluster_radius200.csv"
+META="/scratch/groups/sartandi/rcai2/projects/KMEANS/data/harmonized_level15_full.csv"
 
 # --- Parse configuration from config file ---
 # Get the line number corresponding to this array task
@@ -127,7 +127,17 @@ EOF
 
 # --- Run visualization ---
 echo "Running visualization..."
-"$PYTHON" "$VIS" "$OUT_CSV" -o "$PLOTS" -m "$META"
+"$PYTHON" "$VIS" "$OUT_CSV" -o "$PLOTS" -m "$META" \
+    --freq-pca --freq-csv "$IN_CSV" \
+    --umap --subsample 200000
+
+# --- Run Leiden spatial scatter plots ---
+echo "Running spatial scatter plots..."
+"$PYTHON" "$VIS" "$OUT_CSV" \
+    -o "${PLOTS}/spatial_scatter" \
+    --leiden-spatial-scatter \
+    --leiden-scatter-meta "$META" \
+    --n-fovs-per-cluster 3
 
 # --- Update summary with completion status ---
 COMPLETED_TIME=$(date -Iseconds)

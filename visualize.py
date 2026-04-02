@@ -630,79 +630,128 @@ def plot_cluster_celltype_heatmap(
     logger.info(f"Saved composition matrix: {csv_path}")
 
 
+def _draw_heatmap_large(
+    data: np.ndarray,
+    x_labels: np.ndarray,
+    y_labels: np.ndarray,
+    center_val=None,
+    save_dir: Optional[str] = None,
+    save_file: Optional[str] = None,
+    colormap: str = "vlag",
+    font_scale: float = 1.4,
+    dpi: int = 300
+) -> None:
+    """
+    Draw a clustered heatmap (with dendrograms) matching the KMEANS pipeline style.
+
+    Args:
+        data: 2D array of values (clusters x cell types)
+        x_labels: Row labels (cluster names)
+        y_labels: Column labels (cell type names)
+        center_val: Center value for diverging colormap (e.g. 0 for z-score)
+        save_dir: Directory to save figure
+        save_file: Filename for saved figure
+        colormap: Colormap name (default 'vlag' - diverging)
+        font_scale: Font scale for seaborn
+        dpi: Resolution for saved figure
+    """
+    data = data.copy()
+    data[np.isnan(data)] = 0
+    data[np.isinf(data)] = 0
+    data_df = pd.DataFrame(data, index=x_labels, columns=y_labels)
+
+    sns.set(font_scale=font_scale)
+    n_rows = len(x_labels)
+    fig_height = max(8, n_rows * 0.4)
+    heatmap = sns.clustermap(
+        data_df, cmap=colormap, center=center_val,
+        yticklabels=True, figsize=(10, fig_height)
+    )
+    plt.setp(heatmap.ax_heatmap.get_yticklabels(), rotation=0)
+    plt.tight_layout()
+
+    if save_dir is not None and save_file is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        heatmap.savefig(os.path.join(save_dir, save_file), dpi=dpi, bbox_inches='tight')
+        logger.info(f"Saved: {os.path.join(save_dir, save_file)}")
+    plt.close()
+    sns.set(font_scale=1.0)
+
+
 def plot_neighborhood_composition_heatmap(
     df: pd.DataFrame,
     freq_cols: List[str],
     output_path: str,
     cluster_col: str = 'leiden_cluster',
-    figsize: Tuple[int, int] = (14, 10),
-    cmap: str = 'viridis',
-    annot: bool = True,
-    fmt: str = '.2f'
+    neighborhood_method: str = 'frequency'
 ) -> None:
     """
-    Create a heatmap showing average neighborhood composition for each cluster.
+    Create neighborhood composition heatmaps matching the KMEANS pipeline style.
 
-    This shows the mean neighborhood frequency profile (average of frequency columns)
-    for cells in each cluster - i.e., what is the typical neighborhood environment
-    for cells in each cluster.
+    Generates two heatmaps (same as kmeans_analysis.py):
+    1. Z-score normalized clustermap (diverging 'vlag' colormap, centered at 0)
+    2. Method-aware clustermap (log-transformed for counts, raw for frequency)
 
     Args:
         df: DataFrame with cluster labels and frequency columns
         freq_cols: List of frequency column names (e.g., ['Cancer cell', 'APC', ...])
-        output_path: Path to save the heatmap
+        output_path: Path to save the heatmap (used as base for naming)
         cluster_col: Column name for cluster labels
-        figsize: Figure size (width, height)
-        cmap: Colormap for heatmap
-        annot: Whether to annotate cells with values
-        fmt: Format string for annotations
+        neighborhood_method: 'counts' or 'frequency' - determines transformation
     """
-    logger.info(f"Creating neighborhood composition heatmap...")
+    from scipy.stats import zscore
 
-    # Calculate mean frequency for each cluster
-    composition = df.groupby(cluster_col)[freq_cols].mean()
+    logger.info("Creating neighborhood composition heatmaps (KMEANS style)...")
 
-    # Sort by cluster index
-    composition = composition.sort_index()
+    # Calculate mean values for each cluster
+    merged_dat = df[[cluster_col] + list(freq_cols)].copy()
+    mean_dat = merged_dat.groupby(cluster_col, as_index=False).mean(numeric_only=True)
+    mean_dat_values = mean_dat.drop(cluster_col, axis=1)
 
-    logger.info(f"Neighborhood composition matrix: {composition.shape[0]} clusters x {composition.shape[1]} cell types")
+    save_dir = os.path.dirname(output_path) or '.'
+    base_name = os.path.splitext(os.path.basename(output_path))[0]
+    x_labels = np.array([f"Cluster {x}" for x in mean_dat[cluster_col].values])
+    y_labels = mean_dat_values.columns.values
 
-    # Create heatmap
-    fig, ax = plt.subplots(figsize=figsize)
+    logger.info(f"Neighborhood composition matrix: {len(x_labels)} clusters x {len(y_labels)} cell types")
 
-    # Determine annotation based on matrix size
-    if composition.shape[0] * composition.shape[1] > 500:
-        annot_flag = False
-        logger.info("Large matrix detected, disabling cell annotations")
-    else:
-        annot_flag = annot
-
-    sns.heatmap(
-        composition,
-        cmap=cmap,
-        annot=annot_flag,
-        fmt=fmt,
-        cbar_kws={'label': 'Mean Frequency'},
-        ax=ax,
-        linewidths=0.5 if composition.shape[0] < 30 else 0,
-        linecolor='white' if composition.shape[0] < 30 else None
+    # --- Heatmap 1: Z-score normalized (diverging colormap) ---
+    logger.info("Generating neighborhood composition heatmap (z-score normalized)...")
+    _draw_heatmap_large(
+        data=mean_dat_values.apply(zscore).values,
+        x_labels=x_labels,
+        y_labels=y_labels,
+        center_val=0,
+        save_dir=save_dir,
+        save_file=f'{base_name}_zscore.png'
     )
 
-    ax.set_xlabel('Cell Type (in neighborhood)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Cluster', fontsize=12, fontweight='bold')
-    ax.set_title('Neighborhood Composition by Cluster\n(Mean frequency of cell types in neighborhood)',
-                 fontsize=14, fontweight='bold', pad=20)
+    # --- Heatmap 2: Method-aware transformation ---
+    if neighborhood_method == "counts":
+        logger.info("Generating neighborhood composition heatmap (log-transformed counts)...")
+        plot_data = np.log1p(mean_dat_values.values)
+        center_val_alt = None
+        save_suffix = f"{base_name}_log.png"
+    else:
+        logger.info("Generating neighborhood composition heatmap (raw frequency)...")
+        plot_data = mean_dat_values.values
+        center_val_alt = None
+        save_suffix = f"{base_name}_raw.png"
 
-    # Rotate x-axis labels for better readability
-    plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
+    _draw_heatmap_large(
+        data=plot_data,
+        x_labels=x_labels,
+        y_labels=y_labels,
+        center_val=center_val_alt,
+        save_dir=save_dir,
+        save_file=save_suffix
+    )
 
-    plt.tight_layout()
-    fig.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close(fig)
-    logger.info(f"Saved neighborhood composition heatmap: {output_path}")
-
-    # Also save the composition matrix as CSV
-    csv_path = output_path.replace('.png', '_data.csv')
+    # Save the composition matrix as CSV
+    csv_path = os.path.join(save_dir, f'{base_name}_data.csv')
+    composition = mean_dat_values.copy()
+    composition.index = mean_dat[cluster_col].values
+    composition.index.name = cluster_col
     composition.to_csv(csv_path)
     logger.info(f"Saved neighborhood composition data: {csv_path}")
 
@@ -1054,15 +1103,17 @@ def get_category_colors_dict(categories) -> dict:
 def subsample_fovs_per_neighborhood(
     df: pd.DataFrame,
     n_fovs_per_nh: int = 3,
-    random_state: int = 42
+    random_state: int = 42,
+    cluster_col: str = 'leiden_cluster',
 ) -> pd.DataFrame:
     """
-    Subsample FOVs: select n_fovs_per_nh FOVs per kmeans_neighborhood within each batch.
+    Subsample FOVs: select n_fovs_per_nh FOVs per cluster within each batch.
 
     Args:
-        df: DataFrame with fov, batch, kmeans_neighborhood columns
-        n_fovs_per_nh: Number of FOVs to sample per neighborhood per batch
+        df: DataFrame with fov, batch, and cluster_col columns
+        n_fovs_per_nh: Number of FOVs to sample per cluster per batch
         random_state: Random seed
+        cluster_col: Column name for cluster labels (default: 'leiden_cluster')
 
     Returns:
         Subsampled DataFrame
@@ -1074,8 +1125,8 @@ def subsample_fovs_per_neighborhood(
     for batch in df['batch'].unique():
         batch_df = df[df['batch'] == batch]
 
-        for nh in batch_df['kmeans_neighborhood'].unique():
-            nh_df = batch_df[batch_df['kmeans_neighborhood'] == nh]
+        for nh in batch_df[cluster_col].unique():
+            nh_df = batch_df[batch_df[cluster_col] == nh]
             unique_fovs = nh_df['fov'].unique()
 
             n_to_sample = min(n_fovs_per_nh, len(unique_fovs))
@@ -1169,21 +1220,23 @@ def plot_spatial_fov_comparison(
     fov_name: str,
     figsize: Tuple[float, float] = (20, 10),
     size_scale: float = 0.05,
-    alpha: float = 0.7
+    alpha: float = 0.7,
+    cluster_col: str = 'leiden_cluster',
 ) -> None:
     """
     Plot side-by-side spatial scatter for a single FOV.
-    Left: colored by cell_meta_cluster, Right: colored by kmeans_neighborhood.
+    Left: colored by cell_meta_cluster, Right: colored by cluster_col.
 
     Args:
         fov_df: DataFrame for single FOV
         cell_type_colors: Dict mapping cell_meta_cluster to colors
-        nh_colors: Dict mapping kmeans_neighborhood to colors
+        nh_colors: Dict mapping cluster_col values to colors
         output_path: Path to save figure
         fov_name: FOV identifier for title
         figsize: Figure size (width, height)
         size_scale: Scale factor for cell sizes
         alpha: Point transparency
+        cluster_col: Column name for cluster labels (default: 'leiden_cluster')
     """
     fig, axes = plt.subplots(1, 2, figsize=figsize)
 
@@ -1202,17 +1255,17 @@ def plot_spatial_fov_comparison(
         )
     ax_left.set_xlabel("Centroid X")
     ax_left.set_ylabel("Centroid Y")
-    ax_left.set_title(f"cell_meta_cluster")
+    ax_left.set_title("cell_meta_cluster")
     ax_left.set_aspect('equal')
 
     n_cell_cats = fov_df['cell_meta_cluster'].nunique()
     if n_cell_cats <= 20:
         ax_left.legend(loc='upper right', fontsize=6, markerscale=1.5)
 
-    # Right panel: kmeans_neighborhood
+    # Right panel: cluster_col
     ax_right = axes[1]
-    for cat in sorted(fov_df['kmeans_neighborhood'].unique()):
-        mask = fov_df['kmeans_neighborhood'] == cat
+    for cat in sorted(fov_df[cluster_col].unique()):
+        mask = fov_df[cluster_col] == cat
         color = nh_colors.get(cat, 'gray')
         ax_right.scatter(
             x[mask], y[mask], s=sizes[mask], c=color,
@@ -1220,10 +1273,10 @@ def plot_spatial_fov_comparison(
         )
     ax_right.set_xlabel("Centroid X")
     ax_right.set_ylabel("Centroid Y")
-    ax_right.set_title(f"kmeans_neighborhood")
+    ax_right.set_title(cluster_col)
     ax_right.set_aspect('equal')
 
-    n_nh_cats = fov_df['kmeans_neighborhood'].nunique()
+    n_nh_cats = fov_df[cluster_col].nunique()
     if n_nh_cats <= 20:
         ax_right.legend(loc='upper right', fontsize=6, markerscale=1.5)
 
@@ -1338,21 +1391,23 @@ def plot_spatial_grid_comparison(
     fovs: List[str],
     figsize_per_panel: Tuple[float, float] = (4, 4),
     size_scale: float = 0.03,
-    alpha: float = 0.7
+    alpha: float = 0.7,
+    cluster_col: str = 'leiden_cluster',
 ) -> None:
     """
     Plot side-by-side spatial scatter grid for multiple FOVs.
-    Each row shows one FOV with cell_meta_cluster (left) and kmeans_neighborhood (right).
+    Each row shows one FOV with cell_meta_cluster (left) and cluster_col (right).
 
     Args:
         df: DataFrame with all data
         cell_type_colors: Dict mapping cell_meta_cluster to colors
-        nh_colors: Dict mapping kmeans_neighborhood to colors
+        nh_colors: Dict mapping cluster_col values to colors
         output_path: Path to save figure
         fovs: List of FOV names to plot
         figsize_per_panel: Size per panel
         size_scale: Scale factor for cell sizes
         alpha: Point transparency
+        cluster_col: Column name for cluster labels (default: 'leiden_cluster')
     """
     n_fovs = len(fovs)
     rows = n_fovs
@@ -1388,10 +1443,10 @@ def plot_spatial_grid_comparison(
         ax_left.set_yticks([])
         ax_left.set_ylabel(f"{fov}\n(n={len(fov_df):,})", fontsize=8)
 
-        # Right column: kmeans_neighborhood
+        # Right column: cluster_col
         ax_right = axes[idx, 1]
-        for cat in sorted(df['kmeans_neighborhood'].unique()):
-            mask = fov_df['kmeans_neighborhood'] == cat
+        for cat in sorted(df[cluster_col].unique()):
+            mask = fov_df[cluster_col] == cat
             if mask.sum() == 0:
                 continue
             color = nh_colors.get(cat, 'gray')
@@ -1405,7 +1460,7 @@ def plot_spatial_grid_comparison(
 
     # Column titles
     axes[0, 0].set_title("cell_meta_cluster", fontsize=10, fontweight='bold')
-    axes[0, 1].set_title("kmeans_neighborhood", fontsize=10, fontweight='bold')
+    axes[0, 1].set_title(cluster_col, fontsize=10, fontweight='bold')
 
     # Add legends on the right side
     # Cell type legend
@@ -1417,10 +1472,10 @@ def plot_spatial_grid_comparison(
                                       markerfacecolor=color, markersize=6))
         labels_ct.append(str(cat))
 
-    # Neighborhood legend
+    # Cluster legend
     handles_nh = []
     labels_nh = []
-    for cat in sorted(df['kmeans_neighborhood'].unique()):
+    for cat in sorted(df[cluster_col].unique()):
         color = nh_colors.get(cat, 'gray')
         handles_nh.append(plt.Line2D([0], [0], marker='o', color='w',
                                       markerfacecolor=color, markersize=6))
@@ -1434,9 +1489,9 @@ def plot_spatial_grid_comparison(
     if len(labels_nh) <= 20:
         fig.legend(handles_nh, labels_nh, loc='lower right',
                    bbox_to_anchor=(1.0, 0.05), fontsize=6,
-                   title='kmeans_neighborhood', title_fontsize=7)
+                   title=cluster_col, title_fontsize=7)
 
-    plt.suptitle("Spatial Comparison: cell_meta_cluster vs kmeans_neighborhood",
+    plt.suptitle(f"Spatial Comparison: cell_meta_cluster vs {cluster_col}",
                  fontsize=12, fontweight='bold', y=1.01)
     plt.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -1445,24 +1500,28 @@ def plot_spatial_grid_comparison(
 
 
 def run_spatial_scatter_visualization(
-    csv_path: str,
+    csv_path: Optional[str] = None,
     output_dir: str = 'spatial_plots',
     n_fovs_per_nh: int = 3,
     size_scale: float = 0.05,
-    random_state: int = 42
+    random_state: int = 42,
+    cluster_col: str = 'leiden_cluster',
+    df: Optional[pd.DataFrame] = None,
 ) -> None:
     """
     Run spatial scatter visualization pipeline.
 
-    Reads a CSV with cell neighborhood data and generates scatter plots
-    using centroid coordinates, with circle sizes proportional to cell_size.
+    Generates scatter plots using centroid coordinates, with circle sizes
+    proportional to cell_size. Plots cell_meta_cluster (left) vs cluster_col (right).
 
     Args:
-        csv_path: Path to harmonized_level12_kmeans_nh.csv
+        csv_path: Path to CSV with cell data (ignored if df is provided)
         output_dir: Directory for output plots
-        n_fovs_per_nh: Number of FOVs to sample per neighborhood per batch
+        n_fovs_per_nh: Number of FOVs to sample per cluster per batch
         size_scale: Scale factor for cell sizes
         random_state: Random seed
+        cluster_col: Column name for cluster labels (default: 'leiden_cluster')
+        df: Pre-loaded DataFrame (if provided, csv_path is ignored)
     """
     logger.info("=" * 60)
     logger.info("Spatial Scatter Visualization Pipeline")
@@ -1471,25 +1530,28 @@ def run_spatial_scatter_visualization(
     os.makedirs(output_dir, exist_ok=True)
 
     # Load data
-    logger.info(f"\n[Step 1] Loading data from {csv_path}...")
-    df = pd.read_csv(csv_path)
+    if df is None:
+        if csv_path is None:
+            raise ValueError("Either csv_path or df must be provided")
+        logger.info(f"\n[Step 1] Loading data from {csv_path}...")
+        df = pd.read_csv(csv_path)
     logger.info(f"Loaded {len(df):,} cells from {df['fov'].nunique()} FOVs")
 
     # Validate required columns
     required_cols = ['cell_size', 'centroid-0', 'centroid-1', 'fov',
-                     'cell_meta_cluster', 'batch', 'kmeans_neighborhood']
+                     'cell_meta_cluster', 'batch', cluster_col]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
     # Subsample FOVs
-    logger.info(f"\n[Step 2] Subsampling {n_fovs_per_nh} FOVs per neighborhood per batch...")
-    df_sub = subsample_fovs_per_neighborhood(df, n_fovs_per_nh, random_state)
+    logger.info(f"\n[Step 2] Subsampling {n_fovs_per_nh} FOVs per cluster per batch...")
+    df_sub = subsample_fovs_per_neighborhood(df, n_fovs_per_nh, random_state, cluster_col=cluster_col)
 
     # Generate color maps
     logger.info("\n[Step 3] Generating color maps...")
     cell_type_colors = get_category_colors_dict(df['cell_meta_cluster'])
-    nh_colors = get_category_colors_dict(df['kmeans_neighborhood'])
+    nh_colors = get_category_colors_dict(df[cluster_col])
 
     # Get list of FOVs to plot
     fovs = sorted(df_sub['fov'].unique())
@@ -1503,7 +1565,8 @@ def run_spatial_scatter_visualization(
         nh_colors=nh_colors,
         output_path=os.path.join(output_dir, 'spatial_grid_comparison.png'),
         fovs=fovs,
-        size_scale=size_scale
+        size_scale=size_scale,
+        cluster_col=cluster_col,
     )
 
     # Individual FOV comparison plots (side-by-side)
@@ -1521,7 +1584,8 @@ def run_spatial_scatter_visualization(
             nh_colors=nh_colors,
             output_path=os.path.join(fov_dir_comparison, f'{safe_fov}_comparison.png'),
             fov_name=fov,
-            size_scale=size_scale
+            size_scale=size_scale,
+            cluster_col=cluster_col,
         )
 
     logger.info(f"\nGenerated {len(fovs)} individual FOV comparison plots")
@@ -1537,6 +1601,70 @@ def run_spatial_scatter_visualization(
     logger.info("  - spatial_grid_comparison.png (side-by-side grid)")
     logger.info(f"  - comparison_plots/ ({len(fovs)} individual FOV comparisons)")
     logger.info("=" * 60)
+
+
+def run_leiden_spatial_scatter_visualization(
+    cluster_csv_path: str,
+    metadata_csv_path: str,
+    output_dir: str = 'spatial_plots',
+    n_fovs_per_cluster: int = 3,
+    size_scale: float = 0.05,
+    random_state: int = 42,
+) -> None:
+    """
+    Run spatial scatter visualization for NMF-Leiden clustering results.
+
+    Merges cluster CSV (fov, label, cell_meta_cluster, leiden_cluster) with
+    metadata CSV (fov, label, centroid-0, centroid-1, cell_size, batch) and
+    generates FOV scatter plots showing cell_meta_cluster (left) vs
+    leiden_cluster (right) for a representative sample of FOVs.
+
+    Args:
+        cluster_csv_path: Path to *_nmf_leiden_clusters.csv
+        metadata_csv_path: Path to harmonized metadata CSV with centroid coordinates
+        output_dir: Directory for output plots
+        n_fovs_per_cluster: Number of FOVs to sample per leiden_cluster per batch
+        size_scale: Scale factor for cell sizes in scatter plots
+        random_state: Random seed for FOV subsampling
+    """
+    logger.info("=" * 60)
+    logger.info("Leiden Spatial Scatter Visualization Pipeline")
+    logger.info("=" * 60)
+
+    logger.info(f"\n[Step 1] Loading cluster results from {cluster_csv_path}...")
+    cluster_df = pd.read_csv(cluster_csv_path)
+    logger.info(f"  Cluster CSV: {len(cluster_df):,} cells")
+
+    logger.info(f"\n[Step 2] Loading metadata from {metadata_csv_path}...")
+    meta_df = pd.read_csv(metadata_csv_path)
+    logger.info(f"  Metadata CSV: {len(meta_df):,} cells, columns: {meta_df.columns.tolist()}")
+
+    # Merge: get spatial coords + batch from metadata, cluster labels from cluster_df
+    needed_meta = ['fov', 'label', 'cell_size', 'centroid-0', 'centroid-1', 'batch']
+    available_meta = [c for c in needed_meta if c in meta_df.columns]
+    missing_meta = [c for c in needed_meta if c not in meta_df.columns]
+    if missing_meta:
+        logger.warning(f"  Metadata missing columns: {missing_meta}")
+
+    logger.info(f"\n[Step 3] Merging on fov + label...")
+    merged = cluster_df.merge(meta_df[available_meta], on=['fov', 'label'], how='inner')
+    logger.info(f"  Merged: {len(merged):,} cells ({len(merged)/len(cluster_df)*100:.1f}% of cluster results)")
+
+    required = ['cell_size', 'centroid-0', 'centroid-1', 'fov', 'batch',
+                'cell_meta_cluster', 'leiden_cluster']
+    missing = [c for c in required if c not in merged.columns]
+    if missing:
+        raise ValueError(f"Missing columns after merge: {missing}. "
+                         f"Available: {merged.columns.tolist()}")
+
+    run_spatial_scatter_visualization(
+        df=merged,
+        output_dir=output_dir,
+        n_fovs_per_nh=n_fovs_per_cluster,
+        size_scale=size_scale,
+        random_state=random_state,
+        cluster_col='leiden_cluster',
+    )
 
 
 def run_visualization(
@@ -1875,16 +2003,13 @@ def run_visualization(
                 title="PCA on Original Neighborhood Frequencies (Z-scored)"
             )
 
-            # Generate neighborhood composition heatmap
+            # Generate neighborhood composition heatmaps (KMEANS style)
             plot_neighborhood_composition_heatmap(
                 df=df_freq_merged,
                 freq_cols=freq_cols,
                 output_path=os.path.join(output_dir, f'{basename}_neighborhood_composition_heatmap.png'),
                 cluster_col='leiden_cluster',
-                figsize=(14, 10),
-                cmap='viridis',
-                annot=True,
-                fmt='.3f'
+                neighborhood_method='frequency'
             )
 
             # ---- KDE density contour plots (KMEANS-style visualization) ----
@@ -2189,7 +2314,55 @@ def main():
         help='Scale factor for cell sizes in spatial scatter plots'
     )
 
+    # ---- Leiden spatial scatter options ----
+    parser.add_argument(
+        '--leiden-spatial-scatter',
+        action='store_true',
+        help='Run spatial scatter visualization for NMF-Leiden results '
+             '(merges cluster CSV with metadata CSV for centroid coordinates)'
+    )
+
+    parser.add_argument(
+        '--leiden-scatter-meta',
+        default=None,
+        help='Path to harmonized metadata CSV containing centroid-0, centroid-1, '
+             'cell_size, and batch columns (required with --leiden-spatial-scatter)'
+    )
+
+    parser.add_argument(
+        '--n-fovs-per-cluster',
+        type=int,
+        default=3,
+        help='Number of FOVs to sample per leiden_cluster per batch '
+             '(used with --leiden-spatial-scatter)'
+    )
+
     args = parser.parse_args()
+
+    # Handle Leiden spatial scatter mode
+    if args.leiden_spatial_scatter:
+        if args.cluster_results is None:
+            logger.error("cluster_results is required with --leiden-spatial-scatter")
+            return
+        if args.leiden_scatter_meta is None:
+            logger.error("--leiden-scatter-meta is required with --leiden-spatial-scatter")
+            return
+        if not os.path.exists(args.cluster_results):
+            logger.error(f"Cluster results file not found: {args.cluster_results}")
+            return
+        if not os.path.exists(args.leiden_scatter_meta):
+            logger.error(f"Metadata file not found: {args.leiden_scatter_meta}")
+            return
+
+        run_leiden_spatial_scatter_visualization(
+            cluster_csv_path=args.cluster_results,
+            metadata_csv_path=args.leiden_scatter_meta,
+            output_dir=args.output_dir,
+            n_fovs_per_cluster=args.n_fovs_per_cluster,
+            size_scale=args.size_scale,
+            random_state=args.seed,
+        )
+        return
 
     # Handle spatial scatter mode (standalone)
     if args.spatial_scatter:
